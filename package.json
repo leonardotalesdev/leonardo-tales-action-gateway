@@ -1,0 +1,33 @@
+{
+  "name": "@leonardo-tales/action-gateway",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Local TypeScript execution gateway for consequential AI agent actions with exact approval, Task-scoped limits, replay-safe execution, crash-aware recovery, and inspectable receipts.",
+  "author": "Hakan Demirci",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leonardotalesdev/leonardo-tales-action-gateway.git"
+  },
+  "keywords": ["typescript", "ai-agents", "tool-execution", "approval", "replay-protection", "audit"],
+  "license": "Apache-2.0",
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "os": ["linux"],
+  "engines": { "node": ">=22.18.0" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  },
+  "files": ["dist", "examples/row-export/index.mjs", "README.md", "LICENSE", "LICENSES"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "example": "node examples/row-export/index.mjs",
+    "test:packed": "node scripts/test-packed.mjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.3",
+    "typescript": "5.9.3"
+  }
+}
