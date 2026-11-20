@@ -229,7 +229,8 @@ test('an older refusal with no recorded balance stays blocked', async (t) => {
   delete envelope.record.payload.refusalBasis
   // Fixture only: reconstruct the historical checked envelope, then use only the public API.
   const { computeSnapshotChecksum } = await import('../dist/internal/digest.js')
-  envelope.checksum = computeSnapshotChecksum(envelope.record)
+  const { checksum, ...body } = envelope
+  envelope.checksum = computeSnapshotChecksum(body)
   await writeFile(path, JSON.stringify(envelope))
   const reopened = await createActionGateway(options)
   matches(await reopened.inspect(first.operationKey), { decision: 'BLOCKED', reason: 'task_limit', refusalBasis: null })

@@ -4,10 +4,10 @@ import { createTaskRunStore } from './task-run-store.js';
 import { createTask, createRun, getRunNextAction, transitionRun } from './task-run.js';
 import { validateActionProposal } from './action-contract.js';
 import { createTaskAllowance, nativeRunId, operationId, positiveInteger } from './action-allowance.js';
-import { createTrustedExecutionGateway } from './execution-gateway.js';
-import { approvalDecisionId, approvalRequestId, parseApprovalDecision, parseApprovalRequest } from './gateway-approval.js';
+import { createTrustedExecutionGateway, parseStoredProposal } from './execution-gateway.js';
+import { approvalDecisionId, parseApprovalDecision, parseApprovalRequest } from './gateway-approval.js';
 import { ExecutionGatewayError } from './gateway-contract.js';
-import { computeSnapshotChecksum as digest } from './digest.js';
+import { computeSnapshotChecksum as digest, currentDigestVersion } from './digest.js';
 import { copyLocalJson, localId, localObject, localTimestamp, openLocalAuditPort, openLocalRecordStore } from './local-store.js';
 function runAction(result) {
     if (!result.ok)
@@ -32,7 +32,7 @@ export async function createActionGateway(options) {
     if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
         throw new Error('unsafe-action-gateway-directory');
     const manifest = { schemaVersion: 'action-allowance/v0.1', task, action, revision, approverId, timeoutMs };
-    const state = await openLocalRecordStore(join(directory, 'state'), projectId);
+    const state = await openLocalRecordStore(join(directory, 'state'), projectId, { legacyDigestLocale: options.legacyDigestLocale });
     const audit = await openLocalAuditPort(join(directory, 'audit'), projectId);
     const allowance = createTaskAllowance(projectId, taskId, task.cap, manifest);
     const agentRef = { id: 'action-gateway-host', revision: 1 };
@@ -86,15 +86,22 @@ export async function createActionGateway(options) {
         const registered = await state.read('proposals', operationId(value.key));
         if (!registered)
             return null;
-        const stored = registered.payload;
-        if (stored.binding.proposalDigest !== value.proposalDigest || digest(stored.proposal) !== value.proposalDigest)
+        const hash = state.checksumFor(value.digestVersion);
+        const stored = parseStoredProposal(registered, value.digestVersion, hash);
+        if (stored.binding.proposalDigest !== value.proposalDigest || hash(stored.proposal) !== value.proposalDigest
+            || (value.binding && digest(stored.binding) !== digest(value.binding))) {
             throw new Error('approval-binding-conflict');
-        const row = await state.read('approval-requests', approvalRequestId(stored.binding));
+        }
+        const row = await state.read('approval-requests', stored.requestId);
         if (!row)
             return null;
-        const request = parseApprovalRequest(row.payload, stored.binding, stored.proposal);
+        if (row.digestVersion !== value.digestVersion)
+            throw new Error('approval-binding-conflict');
+        const request = parseApprovalRequest(row.payload, stored.binding, stored.proposal, hash);
         const recorded = await state.read('approval-decisions', approvalDecisionId(request.id));
-        return { request, decision: recorded ? parseApprovalDecision(recorded.payload, request) : null };
+        if (recorded && recorded.digestVersion !== value.digestVersion)
+            throw new Error('approval-binding-conflict');
+        return { request, decision: recorded ? parseApprovalDecision(recorded.payload, request, hash) : null };
     }
     async function receipt(key, override, replayed = false) {
         const { totals, selected } = await allowance.snapshot(state, key);
@@ -150,11 +157,13 @@ export async function createActionGateway(options) {
             if (!localId(runId) || !localId(operationKey) || !supplied || typeof supplied !== 'object' || Array.isArray(supplied))
                 throw new Error('invalid-action-intent');
             const input = copyLocalJson(supplied);
-            const inputDigest = digest(input);
             // Task metadata and the logical identity are written with the same project writer as admission.
             const prepared = await state.exclusive(async (port) => {
                 await allowance.verifyManifest(port, true);
                 const existing = await allowance.read(port, operationKey);
+                const digestVersion = existing?.digestVersion ?? currentDigestVersion;
+                const hash = port.checksumFor(digestVersion);
+                const inputDigest = hash(input);
                 if (existing && existing.inputDigest !== inputDigest)
                     return { operation: existing, conflict: true };
                 const amount = measure(input);
@@ -168,10 +177,10 @@ export async function createActionGateway(options) {
                 const context = await workflow(port, nativeRunId(runId));
                 if (getRunNextAction(context.run) !== 'continue' || now() >= task.expiresAt)
                     throw new Error('run-not-ready');
-                const initial = existing ?? { key: operationKey, runId, amount, createdAt: now(), runRevision: context.run.revision,
+                const initial = existing ?? { digestVersion, key: operationKey, runId, amount, createdAt: now(), runRevision: context.run.revision,
                     inputDigest, phase: 'pending', binding: null };
                 const actionProposal = proposal(context.owner, context.run, initial, input);
-                const operation = { ...initial, proposalDigest: digest(actionProposal) };
+                const operation = { ...initial, proposalDigest: hash(actionProposal) };
                 if (existing && existing.proposalDigest !== operation.proposalDigest)
                     throw new Error('operation-proposal-conflict');
                 if (!existing)
@@ -188,14 +197,17 @@ export async function createActionGateway(options) {
                 return receipt(operationKey, undefined, true);
             if (value.runId !== runId)
                 return receipt(operationKey, { decision: 'BLOCKED', reason: 'operation-bound-to-original-run' });
+            const { digestVersion } = value;
+            const hash = state.checksumFor(digestVersion);
             let endorsed;
-            const matches = (request) => endorsed?.digest === digest(request);
+            const matches = (request) => endorsed?.digest === hash(request);
             const gateway = createTrustedExecutionGateway({
-                scope: { id: `scope-${digest(manifest)}`, revision: 1, projectId, taskId, runId: nativeRunId(runId), agentRef, expiresAt: task.expiresAt },
+                digestVersion,
+                scope: { id: `scope-${hash(manifest)}`, revision: 1, projectId, taskId, runId: nativeRunId(runId), agentRef, expiresAt: task.expiresAt },
                 state, audit, agent, approverIds: [approverId], approvalLifetimeMs: 300_000, adapterTimeoutMs: timeoutMs,
                 host: {
                     actorId: agentRef.id, now, scopeIsCurrent: () => true,
-                    actionIsInScope: (item) => item.id === operationId(value.key) && digest(item) === value.proposalDigest,
+                    actionIsInScope: (item) => item.id === operationId(value.key) && hash(item) === value.proposalDigest,
                     captureDecision: async (request) => {
                         if (!endorsed || !matches(request))
                             throw new ExecutionGatewayError('invalid-approval');
@@ -203,7 +215,7 @@ export async function createActionGateway(options) {
                     },
                     verifyStoredDecision: (decision, request) => matches(request) && decision.approverId === approverId && decision.decision === endorsed?.decision,
                 },
-                admit: (port, binding) => allowance.reserve(port, value.key, binding),
+                admit: (port, binding) => allowance.reserve(port, value.key, binding, digestVersion),
                 actions: [{ definition, profile, adapter: {
                             id: 'action-gateway-local-handler', revision,
                             invoke: async (context) => {
@@ -226,7 +238,7 @@ export async function createActionGateway(options) {
                 if (prepared.actionProposal)
                     await gateway.registerProposal(prepared.actionProposal);
                 const request = await gateway.requestApproval(id);
-                const requestDigest = digest(request);
+                const requestDigest = hash(request);
                 const decision = await review(Object.freeze({ taskId: task.id, runId, operationKey, action,
                     input: request.proposal.input.payload, amount: value.amount, unit: task.unit,
                     cap: task.cap, requestId: request.id, requestDigest, expiresAt: request.expiresAt }));

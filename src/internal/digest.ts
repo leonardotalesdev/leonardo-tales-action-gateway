@@ -1,22 +1,27 @@
 import { createHash } from 'node:crypto'
 
+export const legacyDigestVersion = 'legacy-v0.1'
+export const currentDigestVersion = 'utf16-v1'
+export type DigestVersion = typeof legacyDigestVersion | typeof currentDigestVersion
+export type SnapshotChecksum = (payload: unknown) => string
+
+// Operation input, proposal, scope/definition/policy bindings, approval IDs and
+// digests, and execution identities follow the persisted operation version.
+// Allowance and attempt evidence carry that same version. Local-record v0.1
+// checksums use the legacy hash, and v0.2 checksums always use utf16-v1.
+// Manifest equality uses its validated contents. The historical scope ID still
+// hashes the manifest with the operation's original contract.
+// Scalar project/Task/Run/operation IDs, paths and approval decision IDs keep
+// their bytes, as do audit event IDs over flat arrays of primitives. Task/Run
+// validation and audit event/chain hashing use their own deterministic codecs.
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function normalizeForStableJson(value: unknown): unknown {
-  const json = JSON.stringify(value)
-
-  if (typeof json === 'undefined') {
-    return null
-  }
-
-  return sortJsonValue(JSON.parse(json) as unknown)
-}
-
-function sortJsonValue(value: unknown): unknown {
+function sortJsonValue(value: unknown, compare?: (left: string, right: string) => number): unknown {
   if (Array.isArray(value)) {
-    return value.map(sortJsonValue)
+    return value.map((item) => sortJsonValue(item, compare))
   }
 
   if (!isRecord(value)) {
@@ -24,20 +29,35 @@ function sortJsonValue(value: unknown): unknown {
   }
 
   return Object.fromEntries(
-    Object.entries(value)
-      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
-      .map(([key, item]) => [key, sortJsonValue(item)]),
+    Object.keys(value).sort(compare).map((key) => [key, sortJsonValue(value[key], compare)]),
   )
 }
 
-function stableJsonStringify(value: unknown, spacing = 0) {
-  return JSON.stringify(normalizeForStableJson(value), null, spacing)
-}
-
-export function computeSnapshotChecksum(payload: unknown) {
+function checksum(payload: unknown, compare?: (left: string, right: string) => number) {
   if (typeof payload === 'undefined') {
     throw new Error('File memory payload is required.')
   }
 
-  return createHash('sha256').update(stableJsonStringify(payload)).digest('hex')
+  const json = JSON.stringify(payload)
+  const sorted = sortJsonValue(json === undefined ? null : JSON.parse(json), compare)
+  return createHash('sha256').update(JSON.stringify(sorted), 'utf8').digest('hex')
+}
+
+/**
+ * utf16-v1: SHA-256 of compact UTF-8 JSON. Round-trip through JSON first,
+ * preserve array order, and sort object keys by UTF-16 code units. JSON.stringify
+ * emits array-index keys first in numeric order. Strings retain their original
+ * code units and JSON numbers normalize signed zero.
+ */
+export function computeSnapshotChecksum(payload: unknown) {
+  return checksum(payload)
+}
+
+/** v0.1.0 used the default Node/ICU localeCompare ordering with stable ties. */
+export function createLegacySnapshotChecksum(locale?: string): SnapshotChecksum {
+  if (locale !== undefined && (typeof locale !== 'string' || Intl.Collator.supportedLocalesOf(locale).length !== 1)) {
+    throw new Error('unsupported-legacy-digest-locale')
+  }
+  const { compare } = new Intl.Collator(locale)
+  return (payload) => checksum(payload, compare)
 }

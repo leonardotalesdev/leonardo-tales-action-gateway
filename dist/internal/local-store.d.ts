@@ -1,20 +1,28 @@
+import { type DigestVersion, type SnapshotChecksum } from './digest.js';
 export type LocalStoreErrorCode = 'invalid-record' | 'invalid-id' | 'unsafe-path' | 'locked' | 'already-exists' | 'stale-revision' | 'corrupt-record' | 'write-uncertain' | 'io-error';
 export declare class LocalStoreError extends Error {
     readonly code: LocalStoreErrorCode;
     constructor(code: LocalStoreErrorCode);
 }
-export type LocalRecord = Readonly<{
+type RecordBody = Readonly<{
     kind: string;
     id: string;
     projectId: string;
     revision: number;
     payload: unknown;
 }>;
+export type LocalRecord = RecordBody & Readonly<{
+    digestVersion: DigestVersion;
+}>;
+type RecordWrite = RecordBody & Readonly<{
+    digestVersion?: DigestVersion;
+}>;
 export type LocalRecordPort = Readonly<{
+    checksumFor(version: DigestVersion): SnapshotChecksum;
     read(kind: string, id: string): Promise<LocalRecord | null>;
     list(kind: string): Promise<readonly LocalRecord[]>;
-    create(record: LocalRecord): Promise<void>;
-    save(record: LocalRecord, expectedRevision: number): Promise<void>;
+    create(record: RecordWrite): Promise<void>;
+    save(record: RecordWrite, expectedRevision: number): Promise<void>;
 }>;
 /** Trusted host critical section. Its scoped port expires when the callback settles. */
 export type LocalTransactionalRecordPort = LocalRecordPort & Readonly<{
@@ -33,12 +41,14 @@ export declare function localId(value: unknown): value is string;
 export declare function localRevision(value: unknown): value is number;
 export declare function localTimestamp(value: unknown): value is string;
 export declare function localObject(value: unknown, keys: readonly string[]): Record<string, unknown>;
-/** Strict JSON boundary before the existing canonical checksum helper is used. */
+/** Strict JSON boundary before hashing or writing a record. */
 export declare function copyLocalJson(value: unknown, depth?: number, budget?: {
     nodes: number;
 }): unknown;
-export declare function localRecord(value: unknown): LocalRecord;
 /** Explicit trusted-host storage adapter. No default path, agent tool or auto-recovery. */
-export declare function openLocalRecordStore(directory: string, projectId: string, options?: LocalStoreOptions): Promise<LocalTransactionalRecordPort>;
+export declare function openLocalRecordStore(directory: string, projectId: string, options?: LocalStoreOptions & {
+    legacyDigestLocale?: string;
+}): Promise<LocalTransactionalRecordPort>;
 /** Append-only API; full-file atomic replacement keeps partial JSONL tails out of history. */
 export declare function openLocalAuditPort(directory: string, projectId: string, options?: LocalStoreOptions): Promise<LocalAuditPort>;
+export {};

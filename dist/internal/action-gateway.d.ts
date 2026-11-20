@@ -59,6 +59,8 @@ export type ActionGatewayOptions = Readonly<{
     }>;
     approverId: string;
     review(request: ActionReview): Promise<Decision>;
+    /** Original Node/ICU collation for v0.1.0 records, if different from the current default. */
+    legacyDigestLocale?: string;
     now?(): string;
     timeoutMs?: number;
 }>;

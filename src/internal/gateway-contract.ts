@@ -3,6 +3,7 @@ import type { RunReference } from './task-run.js'
 import type { PolicyEvaluationInput } from './base-policy.js'
 import type { LocalRecordPort, LocalTransactionalRecordPort } from './local-store.js'
 import type { ExecutionAuditPort } from './execution-audit.js'
+import type { DigestVersion } from './digest.js'
 
 export type GatewayScope = Readonly<{
   id: string; revision: number; projectId: string; taskId: string; runId: string
@@ -61,6 +62,7 @@ export type TrustedGatewayHost = Readonly<{
   verifyStoredDecision?(decision: ExactApprovalDecision, request: ExactApprovalRequest): boolean
 }>
 export type ExecutionGatewayOptions = Readonly<{
+  digestVersion: DigestVersion
   scope: GatewayScope; agent: ActionProposalContext['agent']; actions: readonly GatewayAction[]
   state: LocalTransactionalRecordPort; audit: ExecutionAuditPort; host: TrustedGatewayHost
   approverIds: readonly string[]; approvalLifetimeMs: number; adapterTimeoutMs: number

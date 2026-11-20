@@ -25,7 +25,7 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
         if (record.payload && typeof record.payload === 'object' && Object.hasOwn(record.payload, 'refusalBasis'))
             fields.push('refusalBasis');
         const raw = localObject(record.payload, fields);
-        const value = raw;
+        const value = { ...raw, digestVersion: record.digestVersion };
         const binding = value.binding;
         if (!localId(value.key) || record.id !== operationId(value.key) || !localId(value.runId)
             || !localRevision(value.runRevision) || !localTimestamp(value.createdAt) || !positiveInteger(value.amount)
@@ -55,11 +55,11 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
             throw new Error('invalid-task-operation');
         return value;
     }
-    function register(port, value) {
-        return port.create({ kind, projectId, id: operationId(value.key), revision: 1, payload: value });
+    function register(port, { digestVersion, ...value }) {
+        return port.create({ kind, projectId, id: operationId(value.key), revision: 1, payload: value, digestVersion });
     }
     async function outcome(port, value) {
-        return value.phase === 'held' ? await readClosedExecution(port, value.binding) : null;
+        return value.phase === 'held' ? await readClosedExecution(port, value.binding, value.digestVersion) : null;
     }
     async function snapshot(port, key) {
         let remaining = cap;
@@ -87,10 +87,11 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
         }
         return { totals: { cap, settled, held, remaining }, selected };
     }
-    async function reserve(port, key, binding) {
+    async function reserve(port, key, binding, version) {
         await verifyManifest(port);
         const value = await read(port, key);
-        if (!value || value.proposalDigest !== binding.proposalDigest || operationId(key) !== binding.proposalRef.id
+        if (!value || value.digestVersion !== version || value.proposalDigest !== binding.proposalDigest
+            || operationId(key) !== binding.proposalRef.id
             || binding.runId !== nativeRunId(value.runId) || binding.projectId !== projectId || binding.taskId !== taskId) {
             throw new Error('reservation-binding-conflict');
         }
@@ -100,8 +101,9 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
         const { totals } = await snapshot(port);
         const admitted = value.amount <= totals.remaining;
         const decision = admitted ? { phase: 'held' } : { phase: 'blocked', refusalBasis: { reason: 'task_limit', ...totals } };
-        await port.save({ kind, projectId, id: operationId(key), revision: 2,
-            payload: { ...value, binding, ...decision } }, 1);
+        const { digestVersion, ...payload } = value;
+        await port.save({ kind, projectId, id: operationId(key), revision: 2, digestVersion,
+            payload: { ...payload, binding, ...decision } }, 1);
         return admitted;
     }
     return { verifyManifest, read, register, snapshot, reserve };

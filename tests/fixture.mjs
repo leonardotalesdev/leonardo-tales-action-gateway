@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { appendFile, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,6 +7,20 @@ export const time = '2030-01-01T00:00:00.000Z'
 export const first = { runId: 'run-a', operationKey: 'export-1', input: { rows: 4, batch: 'a' } }
 export const second = { runId: 'run-b', operationKey: 'export-2', input: { rows: 3, batch: 'b' } }
 export const third = { runId: 'run-c', operationKey: 'export-3', input: { rows: 4, batch: 'c' } }
+export const reviewedLegacy = { runId: 'run-d', operationKey: 'export-4', input: { rows: 1, batch: 'd' } }
+export const preparedLegacy = { runId: 'run-e', operationKey: 'export-5', input: { rows: 1, batch: 'e' } }
+
+export function legacyIntent(operation) {
+  return { ...operation, input: { ...operation.input, z: 1, ö: 2,
+    nested: [{ 10: 'ten', 2: 'two', z: -0, ö: [null, true, 'Å'] }] } }
+}
+
+export function inLocale(locale, source) {
+  const lang = locale.replace('-', '_') + '.UTF-8'
+  return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+    env: { ...process.env, LANG: lang, LC_ALL: lang, NODE_OPTIONS: '' }, encoding: 'utf8',
+  }))
+}
 
 export async function workspace(t) {
   const path = await mkdtemp(join(tmpdir(), 'action-gateway-test-'))

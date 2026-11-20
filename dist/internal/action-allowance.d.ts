@@ -1,3 +1,4 @@
+import { type DigestVersion } from './digest.js';
 import type { ExactActionBinding } from './gateway-contract.js';
 import { type LocalRecordPort } from './local-store.js';
 export type RefusalBalance = Readonly<{
@@ -8,6 +9,7 @@ export type RefusalBalance = Readonly<{
     remaining: number;
 }>;
 export type Operation = Readonly<{
+    digestVersion: DigestVersion;
     key: string;
     runId: string;
     runRevision: number;
@@ -25,6 +27,7 @@ export declare function positiveInteger(value: unknown): value is number;
 export declare function createTaskAllowance(projectId: string, taskId: string, cap: number, manifest: object): {
     verifyManifest: (port: LocalRecordPort, initialize?: boolean) => Promise<void>;
     read: (port: LocalRecordPort, key: string) => Promise<Readonly<{
+        digestVersion: DigestVersion;
         key: string;
         runId: string;
         runRevision: number;
@@ -36,7 +39,7 @@ export declare function createTaskAllowance(projectId: string, taskId: string, c
         binding: ExactActionBinding | null;
         refusalBasis?: RefusalBalance;
     }> | null>;
-    register: (port: LocalRecordPort, value: Operation) => Promise<void>;
+    register: (port: LocalRecordPort, { digestVersion, ...value }: Operation) => Promise<void>;
     snapshot: (port: LocalRecordPort, key?: string) => Promise<{
         totals: {
             cap: number;
@@ -49,5 +52,5 @@ export declare function createTaskAllowance(projectId: string, taskId: string, c
             result: Awaited<ReturnType<(port: LocalRecordPort, value: Operation) => Promise<import("./gateway-contract.js").ExecutionAdapterResult | null>>>;
         } | undefined;
     }>;
-    reserve: (port: LocalRecordPort, key: string, binding: ExactActionBinding) => Promise<boolean>;
+    reserve: (port: LocalRecordPort, key: string, binding: ExactActionBinding, version: DigestVersion) => Promise<boolean>;
 };

@@ -1,4 +1,4 @@
-import { computeSnapshotChecksum as digest } from './digest.js'
+import { computeSnapshotChecksum as digest, type DigestVersion } from './digest.js'
 import { readClosedExecution } from './execution-gateway.js'
 import type { ExactActionBinding } from './gateway-contract.js'
 import { actionAllowanceKind as kind, localId, localObject, localRevision, localTimestamp,
@@ -9,6 +9,7 @@ export type RefusalBalance = Readonly<{
 }>
 
 export type Operation = Readonly<{
+  digestVersion: DigestVersion
   key: string
   runId: string
   runRevision: number
@@ -45,7 +46,7 @@ export function createTaskAllowance(projectId: string, taskId: string, cap: numb
     // Earlier blocked operations did not record a decision-time balance.
     if (record.payload && typeof record.payload === 'object' && Object.hasOwn(record.payload, 'refusalBasis')) fields.push('refusalBasis')
     const raw = localObject(record.payload, fields)
-    const value = raw as unknown as Operation
+    const value = { ...raw, digestVersion: record.digestVersion } as unknown as Operation
     const binding = value.binding
     if (!localId(value.key) || record.id !== operationId(value.key) || !localId(value.runId)
       || !localRevision(value.runRevision) || !localTimestamp(value.createdAt) || !positiveInteger(value.amount)
@@ -73,12 +74,12 @@ export function createTaskAllowance(projectId: string, taskId: string, cap: numb
     return value
   }
 
-  function register(port: LocalRecordPort, value: Operation) {
-    return port.create({ kind, projectId, id: operationId(value.key), revision: 1, payload: value })
+  function register(port: LocalRecordPort, { digestVersion, ...value }: Operation) {
+    return port.create({ kind, projectId, id: operationId(value.key), revision: 1, payload: value, digestVersion })
   }
 
   async function outcome(port: LocalRecordPort, value: Operation) {
-    return value.phase === 'held' ? await readClosedExecution(port, value.binding!) : null
+    return value.phase === 'held' ? await readClosedExecution(port, value.binding!, value.digestVersion) : null
   }
 
   async function snapshot(port: LocalRecordPort, key?: string) {
@@ -101,10 +102,11 @@ export function createTaskAllowance(projectId: string, taskId: string, cap: numb
     return { totals: { cap, settled, held, remaining }, selected }
   }
 
-  async function reserve(port: LocalRecordPort, key: string, binding: ExactActionBinding) {
+  async function reserve(port: LocalRecordPort, key: string, binding: ExactActionBinding, version: DigestVersion) {
     await verifyManifest(port)
     const value = await read(port, key)
-    if (!value || value.proposalDigest !== binding.proposalDigest || operationId(key) !== binding.proposalRef.id
+    if (!value || value.digestVersion !== version || value.proposalDigest !== binding.proposalDigest
+      || operationId(key) !== binding.proposalRef.id
       || binding.runId !== nativeRunId(value.runId) || binding.projectId !== projectId || binding.taskId !== taskId) {
       throw new Error('reservation-binding-conflict')
     }
@@ -113,8 +115,9 @@ export function createTaskAllowance(projectId: string, taskId: string, cap: numb
     const { totals } = await snapshot(port)
     const admitted = value.amount <= totals.remaining
     const decision = admitted ? { phase: 'held' } : { phase: 'blocked', refusalBasis: { reason: 'task_limit', ...totals } }
-    await port.save({ kind, projectId, id: operationId(key), revision: 2,
-      payload: { ...value, binding, ...decision } }, 1)
+    const { digestVersion, ...payload } = value
+    await port.save({ kind, projectId, id: operationId(key), revision: 2, digestVersion,
+      payload: { ...payload, binding, ...decision } }, 1)
     return admitted
   }
 

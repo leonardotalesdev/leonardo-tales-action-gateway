@@ -2,7 +2,7 @@ import { createTaskRunStore } from './task-run-store.js'
 import { createRun, transitionRun, getRunNextAction, type Run, type RunEvent, type Task } from './task-run.js'
 import { validateActionProposal, type ActionProposal, type ActionProposalInput } from './action-contract.js'
 import { createExecutionAuditStore, validateExecutionAuditEvent, type ExecutionAuditEvent } from './execution-audit.js'
-import { computeSnapshotChecksum as digest } from './digest.js'
+import { computeSnapshotChecksum as digest, legacyDigestVersion, type DigestVersion, type SnapshotChecksum } from './digest.js'
 import { copyLocalJson, localId, localObject, localRevision, localTimestamp, type LocalRecord, type LocalRecordPort } from './local-store.js'
 import { createExecutionStateStore, executionStateIdentity, validateExecutionState, type ExecutionBinding } from './execution-state.js'
 import { assessPolicy, policyInput } from './gateway-policy.js'
@@ -13,7 +13,7 @@ import {
 } from './gateway-contract.js'
 export type * from './gateway-contract.js'
 
-type ProposalRecord = Readonly<{ schemaVersion: 'gateway-proposal/v0.1'; proposal: ActionProposal; taskRevision: number; binding: ExactActionBinding }>
+type ProposalRecord = Readonly<{ proposal: ActionProposal; taskRevision: number; binding: ExactActionBinding; requestId: string }>
 type Attempt = Readonly<{
   schemaVersion: 'gateway-attempt/v0.1'; binding: ExactActionBinding; phase: 'reserved' | 'closed' | 'reconciliation-required'
   pendingEvents: readonly ExecutionAuditEvent[]; result: ExecutionAdapterResult | null; createdAt: string
@@ -42,7 +42,22 @@ function executionBinding(binding: ExactActionBinding): ExecutionBinding {
     proposalRef: binding.proposalRef, proposalDigest: binding.proposalDigest }
 }
 
-function parseAttempt(record: LocalRecord, projectId: string) {
+export function parseStoredProposal(record: LocalRecord, version: DigestVersion, hash: SnapshotChecksum): ProposalRecord {
+  if (record.revision !== 1 || record.digestVersion !== version) fail('invalid-proposal')
+  const payload = record.payload as { schemaVersion?: unknown } | null
+  const legacy = payload?.schemaVersion === 'gateway-proposal/v0.1'
+  if (legacy ? version !== legacyDigestVersion : payload?.schemaVersion !== 'gateway-proposal/v0.2') fail('invalid-proposal')
+  const keys = ['schemaVersion', 'proposal', 'taskRevision', 'binding']
+  const raw = localObject(payload, legacy ? keys : [...keys, 'requestId'])
+  const { proposal, taskRevision, binding } = raw as unknown as Omit<ProposalRecord, 'requestId'>
+  if (!localRevision(taskRevision) || proposal?.id !== record.id) fail('invalid-proposal')
+  const requestId = approvalRequestId(binding, hash)
+  // An upgraded proposal pins the lookup so collation drift cannot orphan a prior request.
+  if (!legacy && raw.requestId !== requestId) fail('invalid-approval')
+  return { proposal, taskRevision, binding, requestId }
+}
+
+function parseAttempt(record: LocalRecord, projectId: string, hash: SnapshotChecksum) {
   const raw = localObject(record.payload, ['schemaVersion', 'binding', 'phase', 'pendingEvents', 'result', 'createdAt'])
   const bound = localObject(raw.binding, ['projectId', 'taskId', 'runId', 'taskRevision', 'baseRunRevision', 'agentRef',
     'proposalRef', 'actionRef', 'proposalDigest', 'definitionDigest', 'policyProfileRef', 'policyInputDigest',
@@ -52,7 +67,7 @@ function parseAttempt(record: LocalRecord, projectId: string) {
     const ref = localObject(bound[name], ['id', 'revision'])
     if (!localId(ref.id) || !localRevision(ref.revision)) fail('invalid-record')
   }
-  const identity = executionStateIdentity(executionBinding(exact))
+  const identity = executionStateIdentity(executionBinding(exact), hash)
   if (raw.schemaVersion !== 'gateway-attempt/v0.1' || record.projectId !== projectId || exact.projectId !== projectId
     || record.id !== identity.id || exact.executionId !== identity.id || exact.executionIdentity !== identity.executionIdentity
     || !localRevision(exact.taskRevision) || !localRevision(exact.baseRunRevision)
@@ -67,17 +82,18 @@ function parseAttempt(record: LocalRecord, projectId: string) {
   if (raw.phase === 'closed' && (!raw.result || resultValue(raw.result).status === 'unknown' || raw.pendingEvents.length !== 0)) fail('invalid-record')
   return { record, value: raw as unknown as Attempt }
 }
-async function loadAttempt(port: LocalRecordPort, exact: ExactActionBinding) {
+async function loadAttempt(port: LocalRecordPort, exact: ExactActionBinding, version: DigestVersion) {
   const record = await port.read('gateway-attempts', exact.executionId)
   if (!record) return null
-  const parsed = parseAttempt(record, exact.projectId)
+  if (record.digestVersion !== version) fail('invalid-record')
+  const parsed = parseAttempt(record, exact.projectId, port.checksumFor(version))
   if (!same(parsed.value.binding, exact)) fail('invalid-record')
   return parsed
 }
 
 /** Positive terminal evidence for a particular durable reservation, never a dispatch permit. */
-export async function readClosedExecution(port: LocalRecordPort, binding: ExactActionBinding) {
-  const attempt = await loadAttempt(port, binding)
+export async function readClosedExecution(port: LocalRecordPort, binding: ExactActionBinding, version: DigestVersion) {
+  const attempt = await loadAttempt(port, binding, version)
   return attempt?.value.phase === 'closed' ? attempt.value.result : null
 }
 
@@ -88,6 +104,8 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
   const approvers = copyLocalJson(options.approverIds) as readonly string[]
   const host = options.host
   const state = options.state
+  const { digestVersion } = options
+  const hash = state.checksumFor(digestVersion)
   const admit = options.admit
   const audit = createExecutionAuditStore(options.audit, scope.projectId)
   const actions = options.actions.map((item): GatewayAction => Object.freeze({
@@ -166,22 +184,19 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
   function binding(proposal: ActionProposal, taskRevision: number): ExactActionBinding {
     const action = registration(proposal)
     const scopeBinding: ExecutionBinding = { projectId: proposal.projectId, taskId: proposal.taskId, runId: proposal.runId,
-      proposalRef: reference(proposal), proposalDigest: digest(proposal) }
-    const identity = executionStateIdentity(scopeBinding)
+      proposalRef: reference(proposal), proposalDigest: hash(proposal) }
+    const identity = executionStateIdentity(scopeBinding, hash)
     return copyLocalJson({ projectId: scope.projectId, taskId: scope.taskId, runId: scope.runId,
       taskRevision, baseRunRevision: proposal.runRevision, agentRef: proposal.agentRef, proposalRef: reference(proposal),
-      actionRef: proposal.actionRef, proposalDigest: scopeBinding.proposalDigest, definitionDigest: digest(action.definition),
-      policyProfileRef: { id: action.profile.id, revision: action.profile.revision }, policyInputDigest: digest(policyInput(proposal, action.profile, false)),
-      adapterRef: { id: action.adapter.id, revision: action.adapter.revision }, scopeDigest: digest({ scope, approvers }),
+      actionRef: proposal.actionRef, proposalDigest: scopeBinding.proposalDigest, definitionDigest: hash(action.definition),
+      policyProfileRef: { id: action.profile.id, revision: action.profile.revision }, policyInputDigest: hash(policyInput(proposal, action.profile, false)),
+      adapterRef: { id: action.adapter.id, revision: action.adapter.revision }, scopeDigest: hash({ scope, approvers }),
       executionId: identity.id, executionIdentity: identity.executionIdentity }) as ExactActionBinding
   }
   async function entry(port: LocalRecordPort, id: string): Promise<ProposalRecord> {
     const record = await port.read('proposals', id)
-    if (!record || record.revision !== 1) fail('invalid-proposal')
-    const raw = localObject(record.payload, ['schemaVersion', 'proposal', 'taskRevision', 'binding'])
-    if (raw.schemaVersion !== 'gateway-proposal/v0.1' || !localRevision(raw.taskRevision)
-      || (raw.proposal as ActionProposal)?.id !== id) fail('invalid-proposal')
-    return raw as unknown as ProposalRecord
+    if (!record) fail('invalid-proposal')
+    return parseStoredProposal(record, digestVersion, hash)
   }
   async function validateCurrent(port: LocalRecordPort, stored: ProposalRecord) {
     current()
@@ -193,7 +208,7 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
     const exact = binding(proposal, work.task.revision)
     if (!same(exact, stored.binding)) fail('stale-context')
     const tail = work.run.appliedEvents.slice(base.appliedEvents.length)
-    const decisionId = approvalDecisionId(approvalRequestId(exact))
+    const decisionId = approvalDecisionId(stored.requestId)
     if (tail.length > 2 || tail.some((event, index) => index === 0
       ? event.type !== 'await-approval' || !same(event.actionRef, reference(proposal))
       : event.type !== 'resolve-approval' || event.outcome !== 'approved' || !same(event.actionRef, reference(proposal))
@@ -215,53 +230,55 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
       actorId, observationCode, subjectRef: { kind: 'proposal', ...reference(proposal) } })
   }
   async function request(port: LocalRecordPort, stored: ProposalRecord): Promise<ExactApprovalRequest | null> {
-    const record = await port.read('approval-requests', approvalRequestId(stored.binding))
-    return record ? parseApprovalRequest(record.payload, stored.binding, stored.proposal) : null
+    const record = await port.read('approval-requests', stored.requestId)
+    if (record && record.digestVersion !== digestVersion) fail('invalid-approval')
+    return record ? parseApprovalRequest(record.payload, stored.binding, stored.proposal, hash) : null
   }
   async function decision(port: LocalRecordPort, requested: ExactApprovalRequest): Promise<ExactApprovalDecision | null> {
     const record = await port.read('approval-decisions', approvalDecisionId(requested.id))
-    return record ? parseApprovalDecision(record.payload, requested) : null
+    if (record && record.digestVersion !== digestVersion) fail('invalid-approval')
+    return record ? parseApprovalDecision(record.payload, requested, hash) : null
   }
   function verifyDecision(value: ExactApprovalDecision, requested: ExactApprovalRequest) {
     if (now() >= requested.expiresAt || now() < value.decidedAt) fail('expired')
     if (!approvers.includes(value.approverId)) fail('invalid-approval')
     const verified = host.verifyStoredDecision ? host.verifyStoredDecision(value, requested) === true
-      : nativeDecisions.get(value.id) === digest(value)
+      : nativeDecisions.get(value.id) === hash(value)
     if (!verified) fail('invalid-approval')
     if (value.decision !== 'APPROVED') fail('approval-denied')
   }
   async function saveAttempt(port: LocalRecordPort, exact: ExactActionBinding, patch: Partial<Attempt>) {
-    const current = await loadAttempt(port, exact)
+    const current = await loadAttempt(port, exact, digestVersion)
     if (!current || current.value.phase === 'closed') fail('replay')
     await port.save({ ...current.record, revision: current.record.revision + 1, payload: { ...current.value, ...patch } }, current.record.revision)
   }
   async function otherPending(port: LocalRecordPort, exact: ExactActionBinding) {
     for (const record of await port.list('gateway-attempts')) {
-      const { value } = parseAttempt(record, scope.projectId)
+      const { value } = parseAttempt(record, scope.projectId, port.checksumFor(record.digestVersion))
       if (value.binding.runId === scope.runId && record.id !== exact.executionId && value.phase !== 'closed') fail('reconciliation-required')
     }
     for (const record of await port.list('execution')) {
-      const value = validateExecutionState(record.payload)
+      const value = validateExecutionState(record.payload, port.checksumFor(record.digestVersion))
       if (record.id !== value.id || record.revision !== value.revision || value.projectId !== scope.projectId) fail('invalid-record')
       if (value.runId === scope.runId && record.id !== exact.executionId
         && ['execution_started', 'execution_unknown', 'reconciliation_required'].includes(value.status)) fail('reconciliation-required')
     }
   }
   async function approvalAdmission(port: LocalRecordPort, exact: ExactActionBinding) {
-    const prior = await loadAttempt(port, exact)
+    const prior = await loadAttempt(port, exact, digestVersion)
     if (prior) fail(prior.value.phase === 'closed' ? 'replay' : 'reconciliation-required')
     await otherPending(port, exact)
   }
   async function markUnknown(port: LocalRecordPort, stored: ProposalRecord) {
-    const executions = createExecutionStateStore(port, scope.projectId)
+    const executions = createExecutionStateStore(port, scope.projectId, digestVersion)
     let execution = await executions.load(stored.binding.executionId)
     if (execution?.status === 'proposed') execution = await executions.recordObservation(execution.id, execution.revision, 'execution_started', now())
     if (execution?.status === 'execution_started') await executions.recordObservation(execution.id, execution.revision, 'execution_unknown', now())
     const work = await workflow(port)
     if (work.run.status === 'running' || (work.run.status === 'paused' && work.run.pausedFrom === 'running')) {
-      await advance(port, work.run, { type: 'block', actionRef: reference(stored.proposal) }, `block-${digest(stored.binding)}`)
+      await advance(port, work.run, { type: 'block', actionRef: reference(stored.proposal) }, `block-${hash(stored.binding)}`)
     }
-    const attempt = await loadAttempt(port, stored.binding)
+    const attempt = await loadAttempt(port, stored.binding, digestVersion)
     if (attempt?.value.phase === 'reserved') await saveAttempt(port, stored.binding, { phase: 'reconciliation-required' })
   }
 
@@ -275,10 +292,14 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
         actionCurrent(proposal)
         const exact = binding(proposal, work.task.revision)
         await otherPending(port, exact)
-        const stored: ProposalRecord = { schemaVersion: 'gateway-proposal/v0.1', proposal, taskRevision: work.task.revision, binding: exact }
+        const stored: ProposalRecord = { proposal, taskRevision: work.task.revision, binding: exact, requestId: approvalRequestId(exact, hash) }
         const existing = await port.read('proposals', proposal.id)
-        if (existing) { if (!same(existing.payload, stored)) fail('stale-context'); return proposal }
-        await port.create({ kind: 'proposals', id: proposal.id, projectId: scope.projectId, revision: 1, payload: stored })
+        if (existing) {
+          if (!same(parseStoredProposal(existing, digestVersion, hash), stored)) fail('stale-context')
+          return proposal
+        }
+        await port.create({ kind: 'proposals', id: proposal.id, projectId: scope.projectId, revision: 1, digestVersion,
+          payload: { schemaVersion: 'gateway-proposal/v0.2', ...stored } })
         return proposal
       })
     },
@@ -292,8 +313,8 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
         if (!requested) {
           const createdAt = now()
           const expiresAt = new Date(Math.min(Date.parse(scope.expiresAt), Date.parse(createdAt) + options.approvalLifetimeMs)).toISOString()
-          requested = makeApprovalRequest(checked.exact, checked.proposal, createdAt, expiresAt)
-          await port.create({ kind: 'approval-requests', id: requested.id, projectId: scope.projectId, revision: 1, payload: requested })
+          requested = makeApprovalRequest(checked.exact, checked.proposal, createdAt, expiresAt, hash)
+          await port.create({ kind: 'approval-requests', id: requested.id, projectId: scope.projectId, revision: 1, payload: requested, digestVersion })
         }
         if (now() >= requested.expiresAt) fail('expired')
         if (checked.run.revision === checked.proposal.runRevision) {
@@ -307,12 +328,12 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
       const requested = await state.exclusive(async (port) => {
         current()
         const row = await port.read('approval-requests', id)
-        if (!row) fail('invalid-approval')
+        if (!row || row.digestVersion !== digestVersion) fail('invalid-approval')
         const proposalId = (row.payload as ExactApprovalRequest)?.proposal?.id
         const stored = await entry(port, proposalId)
         const checked = await validateCurrent(port, stored)
         await approvalAdmission(port, checked.exact)
-        const value = parseApprovalRequest(row.payload, stored.binding, stored.proposal)
+        const value = parseApprovalRequest(row.payload, stored.binding, stored.proposal, hash)
         if (now() >= value.expiresAt) fail('expired')
         return value
       })
@@ -328,11 +349,11 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
         const currentRequest = await request(port, stored)
         if (!currentRequest || !same(currentRequest, requested) || now() >= requested.expiresAt) fail('invalid-approval')
         const value = parseApprovalDecision({ schemaVersion: 'exact-approval-decision/v0.1', id: approvalDecisionId(requested.id),
-          requestId: requested.id, requestDigest: digest(requested), bindingDigest: digest(requested.binding),
-          approverId: supplied.approverId, decision: supplied.decision, decidedAt: now() }, requested)
+          requestId: requested.id, requestDigest: hash(requested), bindingDigest: hash(requested.binding),
+          approverId: supplied.approverId, decision: supplied.decision, decidedAt: now() }, requested, hash)
         if (await decision(port, requested)) fail('invalid-approval')
-        await port.create({ kind: 'approval-decisions', id: value.id, projectId: scope.projectId, revision: 1, payload: value })
-        nativeDecisions.set(value.id, digest(value))
+        await port.create({ kind: 'approval-decisions', id: value.id, projectId: scope.projectId, revision: 1, payload: value, digestVersion })
+        nativeDecisions.set(value.id, hash(value))
         if (checked.run.status === 'awaiting-approval') {
           await advance(port, checked.run, { type: 'resolve-approval', actionRef: reference(checked.proposal),
             approvalRef: { id: value.id, revision: 1 }, outcome: value.decision === 'APPROVED' ? 'approved' : 'denied' }, `resolve-${digest(value.id)}`)
@@ -348,7 +369,7 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
       try {
         const prepared = await state.exclusive(async (port) => {
           stored = await entry(port, id)
-          const prior = await loadAttempt(port, stored.binding)
+          const prior = await loadAttempt(port, stored.binding, digestVersion)
           if (prior) {
             if (prior.value.phase !== 'closed') fail('reconciliation-required')
             fail('replay')
@@ -372,7 +393,7 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
             run = await advance(port, run, { type: 'resolve-approval', actionRef: reference(checked.proposal),
               approvalRef: { id: approved.id, revision: 1 }, outcome: 'approved' }, `resolve-${digest(approved.id)}`)
           }
-          const executions = createExecutionStateStore(port, scope.projectId)
+          const executions = createExecutionStateStore(port, scope.projectId, digestVersion)
           let execution = await executions.load(checked.exact.executionId)
           if (execution && execution.status !== 'proposed') fail(execution.status === 'execution_unknown' || execution.status === 'reconciliation_required' ? 'reconciliation-required' : 'replay')
           if (!execution) execution = await executions.create(executionBinding(checked.exact), now())
@@ -385,7 +406,7 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
             event(checked.proposal, 'execution-started', 'reserved-before-adapter', occurredAt)]
           const attempt: Attempt = { schemaVersion: 'gateway-attempt/v0.1', binding: checked.exact,
             phase: 'reserved', pendingEvents, result: null, createdAt: occurredAt }
-          await port.create({ kind: 'gateway-attempts', id: execution.id, projectId: scope.projectId, revision: 1, payload: attempt })
+          await port.create({ kind: 'gateway-attempts', id: execution.id, projectId: scope.projectId, revision: 1, payload: attempt, digestVersion })
           reservationCreated = true
           await executions.recordObservation(execution.id, 1, 'execution_started', occurredAt)
           for (const value of pendingEvents) await audit.append(value)
@@ -421,13 +442,13 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
         }
         await state.exclusive(async (port) => {
           await saveAttempt(port, stored!.binding, { result: observed })
-          const executions = createExecutionStateStore(port, scope.projectId)
+          const executions = createExecutionStateStore(port, scope.projectId, digestVersion)
           await executions.recordObservation(stored!.binding.executionId, 2, observed.status === 'confirmed-success' ? 'executed' : 'failed', now())
           const work = await workflow(port)
           if (work.run.revision !== prepared.run.revision || work.task.revision !== stored!.taskRevision) fail('stale-context')
           await advance(port, work.run, observed.status === 'confirmed-success'
             ? { type: 'checkpoint', checkpoint: { step: work.run.checkpoint.step + 1, artifactIds: work.run.checkpoint.artifactIds } }
-            : { type: 'fail' }, `result-${digest(stored!.binding)}`)
+            : { type: 'fail' }, `result-${hash(stored!.binding)}`)
           await audit.append(event(stored!.proposal, 'execution-result-recorded', observed.status, now()))
           await saveAttempt(port, stored!.binding, { phase: 'closed', pendingEvents: [] })
         })
@@ -447,7 +468,7 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
     async recordInterrupted(id: string): Promise<GatewayResult> {
       return state.exclusive(async (port) => {
         const stored = await entry(port, id)
-        const attempt = await loadAttempt(port, stored.binding)
+        const attempt = await loadAttempt(port, stored.binding, digestVersion)
         if (!attempt || attempt.value.phase === 'closed') fail('replay')
         await markUnknown(port, stored)
         await audit.append(event(stored.proposal, 'reconciliation-started', 'interrupted-worker-no-retry', now()))

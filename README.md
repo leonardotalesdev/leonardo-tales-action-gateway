@@ -55,6 +55,14 @@ Return `{ outcome: 'executed', evidenceId }` after confirming the effect, `{ out
 
 Receipts expose `decision`, `reason`, original identities, digests, requested units, approval and evidence references, and the observed Task totals. `remaining = cap - settled - held`. A cap refusal also has a durable `refusalBasis` with the original reason, requested amount and decision-time totals. The operation stays blocked even if capacity later becomes available. Earlier records without that historical balance return `refusalBasis: null`. Inspection can observe in-flight state. A receipt conveys no dispatch authority.
 
+## Persisted digests
+
+New operations use SHA-256 of compact UTF-8 JSON. Object keys sort by UTF-16 code units, with array-index keys emitted first in numeric order by JSON serialization. Arrays keep their original order and strings keep their original Unicode form. New record envelopes checksum their version and contents using this format.
+
+The gateway reads v0.1.0 records automatically when the runtime's default Node/ICU collation reproduces their legacy checksums. Each historical operation keeps its original digests and exact approval binding. A pending request retains its request ID, request digest, original Run and expiry. Resubmitting it still requires the host to endorse that exact request through `review`.
+
+Stop v0.1.0 writers before opening the directory with the updated gateway. If the host locale changed, configure the original collation with `legacyDigestLocale`, for example `'sv-SE'`. The gateway verifies legacy records with one configured collation. If validation fails, keep the original directory and recover the original Node/ICU runtime and locale before retrying. A store with incompatible legacy collations or one whose original collation cannot be reproduced requires maintainer-assisted recovery. The original v0.1.0 release cannot open records written in the new envelope format.
+
 ## Scope and recovery
 
 - The trusted host must control the only route to the handler and its credential. The host assigns Task and operation identities, owns the cap, and authenticates the approver. Expose only ordinary input arguments to an agent. Creating another Task or choosing another store creates an independent allowance.

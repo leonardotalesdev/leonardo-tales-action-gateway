@@ -1,4 +1,4 @@
-import { computeSnapshotChecksum } from './digest.js'
+import type { DigestVersion, SnapshotChecksum } from './digest.js'
 import { localId, localObject, localRevision, localTimestamp, LocalStoreError, type LocalRecordPort } from './local-store.js'
 
 export type ExecutionStatus = 'proposed' | 'execution_started' | 'execution_unknown'
@@ -24,21 +24,21 @@ function binding(value: ExecutionBinding): ExecutionBinding {
   return Object.freeze({ projectId: raw.projectId, taskId: raw.taskId, runId: raw.runId,
     proposalRef: Object.freeze({ id: ref.id, revision: ref.revision }), proposalDigest: raw.proposalDigest })
 }
-function identities(value: ExecutionBinding) {
+function identities(value: ExecutionBinding, hash: SnapshotChecksum) {
   const { proposalDigest, ...reference } = value
-  return { id: `execution-${computeSnapshotChecksum(reference)}`,
-    executionIdentity: `action-${computeSnapshotChecksum({ ...reference, proposalDigest })}` }
+  return { id: `execution-${hash(reference)}`,
+    executionIdentity: `action-${hash({ ...reference, proposalDigest })}` }
 }
 /** Deterministic metadata only; it neither reserves nor authorizes an attempt. */
-export function executionStateIdentity(value: ExecutionBinding) {
-  return Object.freeze(identities(binding(value)))
+export function executionStateIdentity(value: ExecutionBinding, hash: SnapshotChecksum) {
+  return Object.freeze(identities(binding(value), hash))
 }
-export function validateExecutionState(value: unknown): ExecutionState {
+export function validateExecutionState(value: unknown, hash: SnapshotChecksum): ExecutionState {
   const raw = localObject(value, ['schemaVersion', 'id', 'executionIdentity', 'revision', 'status',
     'createdAt', 'updatedAt', 'projectId', 'taskId', 'runId', 'proposalRef', 'proposalDigest'])
   const scope = binding({ projectId: raw.projectId, taskId: raw.taskId, runId: raw.runId,
     proposalRef: raw.proposalRef, proposalDigest: raw.proposalDigest } as ExecutionBinding)
-  const identity = identities(scope)
+  const identity = identities(scope, hash)
   if (raw.schemaVersion !== 'execution-state/v0.1' || raw.id !== identity.id || raw.executionIdentity !== identity.executionIdentity
     || !localRevision(raw.revision) || !localTimestamp(raw.createdAt) || !localTimestamp(raw.updatedAt)
     || raw.updatedAt < raw.createdAt || !['proposed', 'execution_started', 'execution_unknown',
@@ -52,11 +52,13 @@ export function validateExecutionState(value: unknown): ExecutionState {
     status: raw.status as ExecutionStatus, createdAt: raw.createdAt, updatedAt: raw.updatedAt })
 }
 
-export function createExecutionStateStore(port: LocalRecordPort, projectId: string) {
+export function createExecutionStateStore(port: LocalRecordPort, projectId: string, digestVersion: DigestVersion) {
+  const hash = port.checksumFor(digestVersion)
   async function load(id: string): Promise<ExecutionState | null> {
     const record = await port.read('execution', id)
     if (!record) return null
-    const state = validateExecutionState(record.payload)
+    if (record.digestVersion !== digestVersion) throw new LocalStoreError('corrupt-record')
+    const state = validateExecutionState(record.payload, hash)
     if (record.id !== state.id || record.projectId !== projectId || state.projectId !== projectId
       || record.revision !== state.revision) throw new LocalStoreError('corrupt-record')
     const run = await port.read('runs', state.runId)
@@ -79,9 +81,9 @@ export function createExecutionStateStore(port: LocalRecordPort, projectId: stri
         || !localTimestamp(parent.createdAt) || createdAt < parent.createdAt) {
         throw new LocalStoreError('invalid-record')
       }
-      const state: ExecutionState = Object.freeze({ ...scope, ...identities(scope), schemaVersion: 'execution-state/v0.1',
+      const state: ExecutionState = Object.freeze({ ...scope, ...identities(scope, hash), schemaVersion: 'execution-state/v0.1',
         revision: 1, status: 'proposed', createdAt, updatedAt: createdAt })
-      await port.create({ kind: 'execution', id: state.id, projectId, revision: 1, payload: state })
+      await port.create({ kind: 'execution', id: state.id, projectId, revision: 1, payload: state, digestVersion })
       return state
     },
     /** Persist host observations only. M3 neither authorizes nor dispatches the described action. */
@@ -94,7 +96,7 @@ export function createExecutionStateStore(port: LocalRecordPort, projectId: stri
       }
       if (!transitions[previous.status].includes(status) || !localTimestamp(occurredAt)
         || occurredAt < previous.updatedAt || !localRevision(expectedRevision + 1)) throw new LocalStoreError('invalid-record')
-      const state = validateExecutionState({ ...previous, status, revision: expectedRevision + 1, updatedAt: occurredAt })
+      const state = validateExecutionState({ ...previous, status, revision: expectedRevision + 1, updatedAt: occurredAt }, hash)
       await port.save({ kind: 'execution', id, projectId, revision: state.revision, payload: state }, expectedRevision)
       return state
     },

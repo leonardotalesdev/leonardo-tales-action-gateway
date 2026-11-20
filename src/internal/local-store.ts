@@ -3,7 +3,8 @@ import { lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-import { computeSnapshotChecksum } from './digest.js'
+import { computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion,
+  type DigestVersion, type SnapshotChecksum } from './digest.js'
 
 export type LocalStoreErrorCode = 'invalid-record' | 'invalid-id' | 'unsafe-path' | 'locked'
   | 'already-exists' | 'stale-revision' | 'corrupt-record' | 'write-uncertain' | 'io-error'
@@ -11,14 +12,17 @@ export class LocalStoreError extends Error {
   readonly code: LocalStoreErrorCode
   constructor(code: LocalStoreErrorCode) { super(code); this.code = code }
 }
-export type LocalRecord = Readonly<{
+type RecordBody = Readonly<{
   kind: string; id: string; projectId: string; revision: number; payload: unknown
 }>
+export type LocalRecord = RecordBody & Readonly<{ digestVersion: DigestVersion }>
+type RecordWrite = RecordBody & Readonly<{ digestVersion?: DigestVersion }>
 export type LocalRecordPort = Readonly<{
+  checksumFor(version: DigestVersion): SnapshotChecksum
   read(kind: string, id: string): Promise<LocalRecord | null>
   list(kind: string): Promise<readonly LocalRecord[]>
-  create(record: LocalRecord): Promise<void>
-  save(record: LocalRecord, expectedRevision: number): Promise<void>
+  create(record: RecordWrite): Promise<void>
+  save(record: RecordWrite, expectedRevision: number): Promise<void>
 }>
 /** Trusted host critical section. Its scoped port expires when the callback settles. */
 export type LocalTransactionalRecordPort = LocalRecordPort & Readonly<{
@@ -36,6 +40,7 @@ export type LocalStoreOptions = Readonly<{
 export const actionAllowanceKind = 'action-allowance'
 const kinds = ['tasks', 'runs', 'execution', 'proposals', 'approval-requests', 'approval-decisions', 'gateway-attempts', actionAllowanceKind]
 const immutableKinds = ['proposals', 'approval-requests', 'approval-decisions']
+const recordKeys = ['kind', 'id', 'projectId', 'revision', 'payload']
 const maxBytes = 16 * 1024 * 1024
 export function localId(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(value)
@@ -63,7 +68,7 @@ export function localObject(value: unknown, keys: readonly string[]): Record<str
   }
   return result
 }
-/** Strict JSON boundary before the existing canonical checksum helper is used. */
+/** Strict JSON boundary before hashing or writing a record. */
 export function copyLocalJson(value: unknown, depth = 0, budget = { nodes: 0 }): unknown {
   if (++budget.nodes > 100_000 || depth > 32) throw new LocalStoreError('invalid-record')
   if (value === null || typeof value === 'boolean') return value
@@ -94,8 +99,8 @@ export function copyLocalJson(value: unknown, depth = 0, budget = { nodes: 0 }):
   }
   return Object.freeze(result)
 }
-export function localRecord(value: unknown): LocalRecord {
-  const raw = localObject(value, ['kind', 'id', 'projectId', 'revision', 'payload'])
+function localRecord(value: unknown): RecordBody {
+  const raw = localObject(value, recordKeys)
   if (!localId(raw.id) || !localId(raw.projectId) || !String(raw.projectId).startsWith('project-')) throw new LocalStoreError('invalid-id')
   if (typeof raw.kind !== 'string' || !kinds.includes(raw.kind) || !localRevision(raw.revision)) throw new LocalStoreError('invalid-record')
   return Object.freeze({ kind: raw.kind, id: raw.id, projectId: raw.projectId,
@@ -195,7 +200,13 @@ async function area(directory: string, projectId: string, options: LocalStoreOpt
 
 /** Explicit trusted-host storage adapter. No default path, agent tool or auto-recovery. */
 export async function openLocalRecordStore(directory: string, projectId: string,
-  options: LocalStoreOptions = {}): Promise<LocalTransactionalRecordPort> {
+  options: LocalStoreOptions & { legacyDigestLocale?: string } = {}): Promise<LocalTransactionalRecordPort> {
+  const legacyChecksum = createLegacySnapshotChecksum(options.legacyDigestLocale)
+  function checksumFor(version: DigestVersion) {
+    if (version === legacyDigestVersion) return legacyChecksum
+    if (version === currentDigestVersion) return computeSnapshotChecksum
+    throw new LocalStoreError('invalid-record')
+  }
   const { base, writer } = await area(directory, projectId, options)
   for (const kind of kinds) await safeDirectory(join(base, kind), true)
   function pathFor(kind: string, id: string) {
@@ -203,21 +214,33 @@ export async function openLocalRecordStore(directory: string, projectId: string,
     if (!localId(id)) throw new LocalStoreError('invalid-id')
     return join(base, kind, `${computeSnapshotChecksum(id)}.json`)
   }
+  function decode(text: string, kind: string, id?: string): LocalRecord {
+    const value = JSON.parse(text)
+    const schemaVersion = value?.schemaVersion
+    const legacy = schemaVersion === 'local-record-envelope/v0.1'
+    if (!legacy && schemaVersion !== 'local-record-envelope/v0.2') throw new Error()
+    const raw = localObject(value, legacy ? ['schemaVersion', 'record', 'checksum']
+      : ['schemaVersion', 'digestVersion', 'record', 'checksum'])
+    const record = localRecord(raw.record)
+    const digestVersion = legacy ? legacyDigestVersion : raw.digestVersion
+    if (digestVersion !== legacyDigestVersion && digestVersion !== currentDigestVersion) throw new Error()
+    // v0.2 always hashes deterministically and includes the identity contract in the checksum.
+    const checksum = legacy ? legacyChecksum(record) : computeSnapshotChecksum({ schemaVersion, digestVersion, record })
+    if (raw.checksum !== checksum || record.projectId !== projectId || record.kind !== kind
+      || (id !== undefined && record.id !== id)) throw new Error()
+    return Object.freeze({ ...record, digestVersion })
+  }
   async function read(kind: string, id: string): Promise<LocalRecord | null> {
     const path = pathFor(kind, id)
     await safeDirectory(dirname(path), false)
     const text = await readText(path)
     if (text === null) return null
-    try {
-      const raw = localObject(JSON.parse(text), ['schemaVersion', 'record', 'checksum'])
-      const record = localRecord(raw.record)
-      if (raw.schemaVersion !== 'local-record-envelope/v0.1' || raw.checksum !== computeSnapshotChecksum(record)
-        || record.projectId !== projectId || record.id !== id || record.kind !== kind) throw new Error()
-      return record
-    } catch { throw new LocalStoreError('corrupt-record') }
+    try { return decode(text, kind, id) } catch { throw new LocalStoreError('corrupt-record') }
   }
-  async function write(value: LocalRecord, expected: number | null, replace: (path: string, text: string) => Promise<void>) {
-    const record = localRecord(value)
+  async function write(value: RecordWrite, expected: number | null, replace: (path: string, text: string) => Promise<void>) {
+    const keys = value && Object.hasOwn(value, 'digestVersion') ? [...recordKeys, 'digestVersion'] : recordKeys
+    const { digestVersion, ...body } = localObject(value, keys)
+    const record = localRecord(body)
     if (record.projectId !== projectId) throw new LocalStoreError('invalid-record')
     const previous = await read(record.kind, record.id)
     if (expected === null) {
@@ -228,8 +251,12 @@ export async function openLocalRecordStore(directory: string, projectId: string,
       if (!localRevision(expected) || !previous || previous.revision !== expected
         || !localRevision(expected + 1) || record.revision !== expected + 1) throw new LocalStoreError('stale-revision')
     }
-    await replace(pathFor(record.kind, record.id), `${JSON.stringify({ schemaVersion: 'local-record-envelope/v0.1',
-      record, checksum: computeSnapshotChecksum(record) })}\n`)
+    const version = digestVersion ?? previous?.digestVersion ?? currentDigestVersion
+    if ((version !== legacyDigestVersion && version !== currentDigestVersion)
+      || (previous && version !== previous.digestVersion)) throw new LocalStoreError('invalid-record')
+    const envelope = { schemaVersion: 'local-record-envelope/v0.2', digestVersion: version, record }
+    await replace(pathFor(record.kind, record.id), `${JSON.stringify({ ...envelope,
+      checksum: computeSnapshotChecksum(envelope) })}\n`)
   }
   async function list(kind: string) {
     pathFor(kind, 'validate-id')
@@ -239,25 +266,25 @@ export async function openLocalRecordStore(directory: string, projectId: string,
       if (!/^[a-f0-9]{64}\.json$/.test(name)) continue
       const text = await readText(join(base, kind, name))
       try {
-        const raw = localObject(JSON.parse(text!), ['schemaVersion', 'record', 'checksum'])
-        const record = localRecord(raw.record)
+        const record = decode(text!, kind)
         if (`${computeSnapshotChecksum(record.id)}.json` !== name) throw new Error()
-        results.push((await read(kind, record.id))!)
+        results.push(record)
       } catch { throw new LocalStoreError('corrupt-record') }
     }
     return Object.freeze(results)
   }
-  return Object.freeze({ read, list,
-    create: (record: LocalRecord) => writer((replace) => write(record, null, replace)),
-    save: (record: LocalRecord, expectedRevision: number) => writer((replace) => write(record, expectedRevision, replace)),
+  return Object.freeze({ checksumFor, read, list,
+    create: (record: RecordWrite) => writer((replace) => write(record, null, replace)),
+    save: (record: RecordWrite, expectedRevision: number) => writer((replace) => write(record, expectedRevision, replace)),
     exclusive: <T>(work: (port: LocalRecordPort) => Promise<T>) => writer(async (replace) => {
       let active = true
       function check() { if (!active) throw new LocalStoreError('locked') }
       const scoped: LocalRecordPort = Object.freeze({
+        checksumFor: (version) => { check(); return checksumFor(version) },
         read: async (kind: string, id: string) => { check(); const result = await read(kind, id); check(); return result },
         list: async (kind: string) => { check(); const result = await list(kind); check(); return result },
-        create: async (record: LocalRecord) => { check(); await write(record, null, replace) },
-        save: async (record: LocalRecord, expected: number) => { check(); await write(record, expected, replace) },
+        create: async (record: RecordWrite) => { check(); await write(record, null, replace) },
+        save: async (record: RecordWrite, expected: number) => { check(); await write(record, expected, replace) },
       })
       try { return await work(scoped) } finally { active = false }
     }),
