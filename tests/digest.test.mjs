@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
-import { computeSnapshotChecksum } from '../dist/internal/digest.js'
+import { computeSnapshotChecksum, createLegacySnapshotChecksum } from '../dist/internal/digest.js'
+import { openLocalRecordStore } from '../dist/internal/local-store.js'
 import { inLocale, workspace } from './fixture.mjs'
 
 const digestUrl = new URL('../dist/internal/digest.js', import.meta.url).href
@@ -53,6 +54,60 @@ test('utf16-v1 preserves JSON primitive bytes and normalizes signed zero', () =>
     ['Å\n', '"Å\\n"'], [12.5, '12.5'], [-0, '0'], [0, '0']]) {
     assert.equal(computeSnapshotChecksum(value), sha256(bytes))
   }
+})
+
+test('utf16-v1 rejects unsupported values before JSON serialization', () => {
+  const accessor = () => assert.fail('accessors must not be invoked')
+  const cyclic = {}
+  cyclic.child = cyclic
+  const cases = [
+    ['undefined property', { a: undefined }],
+    ['NaN', NaN],
+    ['undefined', undefined],
+    ['Infinity', Infinity],
+    ['negative Infinity', -Infinity],
+    ['BigInt', 1n],
+    ['function', () => null],
+    ['symbol value', Symbol('value')],
+    ['symbol key', { [Symbol('key')]: null }],
+    ['Date', new Date(0)],
+    ['Map', new Map()],
+    ['sparse array', Array(1)],
+    ['extra array property', Object.assign([null], { extra: true })],
+    ['object getter', { get a() { return accessor() } }],
+    ['array getter', Object.defineProperty([null], '0', { get: accessor })],
+    ['toJSON hook', { toJSON: accessor }],
+    ['own __proto__ key', { ['__proto__']: null }],
+    ['constructor key', { constructor: null }],
+    ['prototype key', { prototype: null }],
+    ['custom prototype', Object.create({ a: 1 })],
+    ['cyclic object', cyclic],
+    ['depth limit', Array.from({ length: 33 }).reduce((child) => ({ child }), null)],
+    ['array length limit', Array(50_001).fill(null)],
+    ['node limit', [Array(50_000).fill(null), Array(50_000).fill(null)]],
+    ['string length limit', 'a'.repeat(16 * 1024 * 1024 + 1)],
+  ]
+  for (const [name, input] of cases) {
+    assert.throws(() => computeSnapshotChecksum(input), { code: 'invalid-record' }, name)
+  }
+})
+
+test('record envelope hashing preserves existing depth and node limits for record payloads', async (t) => {
+  const directory = await workspace(t)
+  const projectId = 'project-digest-bounds'
+  const store = await openLocalRecordStore(directory, projectId)
+  // Including the outer array, this reaches depth 32 and contains 100,000 nodes.
+  const nested = Array.from({ length: 31 }).reduce((child) => [child], null)
+  const payload = [nested, Array(50_000).fill(null), Array(49_965).fill(null)]
+  const record = { kind: 'tasks', id: 'task-digest-bounds', projectId, revision: 1, payload }
+  await store.create(record)
+  assert.deepEqual(await store.read(record.kind, record.id), { ...record, digestVersion: 'utf16-v1' })
+})
+
+test('legacy digest retains v0.1.0 JSON coercions', () => {
+  const checksum = createLegacySnapshotChecksum('en-US')
+  assert.equal(checksum({ a: undefined }), sha256('{}'))
+  assert.equal(checksum(NaN), sha256('null'))
 })
 
 test('new Gateway requests match across collations and resume unchanged after a locale change', async (t) => {

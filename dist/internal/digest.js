@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { copyLocalJson } from './local-record.js';
 export const legacyDigestVersion = 'legacy-v0.1';
 export const currentDigestVersion = 'utf16-v1';
 // Operation input, proposal, scope/definition/policy bindings, approval IDs and
@@ -22,22 +23,30 @@ function sortJsonValue(value, compare) {
     }
     return Object.fromEntries(Object.keys(value).sort(compare).map((key) => [key, sortJsonValue(value[key], compare)]));
 }
-function checksum(payload, compare) {
+function hashJson(value) {
+    return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+function legacyChecksum(payload, compare) {
     if (typeof payload === 'undefined') {
         throw new Error('File memory payload is required.');
     }
     const json = JSON.stringify(payload);
     const sorted = sortJsonValue(json === undefined ? null : JSON.parse(json), compare);
-    return createHash('sha256').update(JSON.stringify(sorted), 'utf8').digest('hex');
+    return hashJson(sorted);
 }
 /**
- * utf16-v1: SHA-256 of compact UTF-8 JSON. Round-trip through JSON first,
- * preserve array order, and sort object keys by UTF-16 code units. JSON.stringify
- * emits array-index keys first in numeric order. Strings retain their original
- * code units and JSON numbers normalize signed zero.
+ * utf16-v1 hashes compact UTF-8 JSON after validating and copying the input.
+ * The copy preserves array order, sorts object keys by UTF-16 code units, and
+ * normalizes signed zero. JSON.stringify emits array-index keys first in numeric
+ * order. Strings retain their original code units.
  */
 export function computeSnapshotChecksum(payload) {
-    return checksum(payload);
+    return hashJson(copyLocalJson(payload));
+}
+export function computeRecordEnvelopeChecksum(envelope) {
+    // Count the payload against its existing limits. The envelope adds two
+    // object levels and eight nodes (two objects and six metadata fields).
+    return hashJson(copyLocalJson(envelope, -2, { nodes: -8 }));
 }
 /** v0.1.0 used the default Node/ICU localeCompare ordering with stable ties. */
 export function createLegacySnapshotChecksum(locale) {
@@ -45,5 +54,5 @@ export function createLegacySnapshotChecksum(locale) {
         throw new Error('unsupported-legacy-digest-locale');
     }
     const { compare } = new Intl.Collator(locale);
-    return (payload) => checksum(payload, compare);
+    return (payload) => legacyChecksum(payload, compare);
 }

@@ -3,18 +3,11 @@ import { lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-import { computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion,
+import { computeRecordEnvelopeChecksum, computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion,
   type DigestVersion, type SnapshotChecksum } from './digest.js'
+import { copyLocalJson, LocalStoreError, maxBytes, type RecordBody } from './local-record.js'
 
-export type LocalStoreErrorCode = 'invalid-record' | 'invalid-id' | 'unsafe-path' | 'locked'
-  | 'already-exists' | 'stale-revision' | 'corrupt-record' | 'write-uncertain' | 'io-error'
-export class LocalStoreError extends Error {
-  readonly code: LocalStoreErrorCode
-  constructor(code: LocalStoreErrorCode) { super(code); this.code = code }
-}
-type RecordBody = Readonly<{
-  kind: string; id: string; projectId: string; revision: number; payload: unknown
-}>
+export { copyLocalJson, LocalStoreError, type LocalStoreErrorCode } from './local-record.js'
 export type LocalRecord = RecordBody & Readonly<{ digestVersion: DigestVersion }>
 type RecordWrite = RecordBody & Readonly<{ digestVersion?: DigestVersion }>
 export type LocalRecordPort = Readonly<{
@@ -41,7 +34,6 @@ export const actionAllowanceKind = 'action-allowance'
 const kinds = ['tasks', 'runs', 'execution', 'proposals', 'approval-requests', 'approval-decisions', 'gateway-attempts', actionAllowanceKind]
 const immutableKinds = ['proposals', 'approval-requests', 'approval-decisions']
 const recordKeys = ['kind', 'id', 'projectId', 'revision', 'payload']
-const maxBytes = 16 * 1024 * 1024
 export function localId(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(value)
 }
@@ -67,37 +59,6 @@ export function localObject(value: unknown, keys: readonly string[]): Record<str
     result[key] = descriptor.value
   }
   return result
-}
-/** Strict JSON boundary before hashing or writing a record. */
-export function copyLocalJson(value: unknown, depth = 0, budget = { nodes: 0 }): unknown {
-  if (++budget.nodes > 100_000 || depth > 32) throw new LocalStoreError('invalid-record')
-  if (value === null || typeof value === 'boolean') return value
-  if (typeof value === 'string' && value.length <= maxBytes) return value
-  // Match the persisted JSON number before a caller can hash or meter the copy.
-  if (typeof value === 'number' && Number.isFinite(value)) return Object.is(value, -0) ? 0 : value
-  if (Array.isArray(value)) {
-    if (value.length > 50_000 || Reflect.ownKeys(value).length !== value.length + 1) throw new LocalStoreError('invalid-record')
-    const result: unknown[] = []
-    for (let i = 0; i < value.length; i++) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(i))
-      if (!descriptor || !('value' in descriptor)) throw new LocalStoreError('invalid-record')
-      result.push(copyLocalJson(descriptor.value, depth + 1, budget))
-    }
-    return Object.freeze(result)
-  }
-  if (!value || typeof value !== 'object' || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
-    throw new LocalStoreError('invalid-record')
-  }
-  const result: Record<string, unknown> = Object.create(null)
-  const keys = Reflect.ownKeys(value)
-  if (keys.some((key) => typeof key !== 'string')) throw new LocalStoreError('invalid-record')
-  for (const key of (keys as string[]).sort()) {
-    if (['__proto__', 'constructor', 'prototype'].includes(key)) throw new LocalStoreError('invalid-record')
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)
-    if (!descriptor || !('value' in descriptor)) throw new LocalStoreError('invalid-record')
-    result[key] = copyLocalJson(descriptor.value, depth + 1, budget)
-  }
-  return Object.freeze(result)
 }
 function localRecord(value: unknown): RecordBody {
   const raw = localObject(value, recordKeys)
@@ -225,7 +186,7 @@ export async function openLocalRecordStore(directory: string, projectId: string,
     const digestVersion = legacy ? legacyDigestVersion : raw.digestVersion
     if (digestVersion !== legacyDigestVersion && digestVersion !== currentDigestVersion) throw new Error()
     // v0.2 always hashes deterministically and includes the identity contract in the checksum.
-    const checksum = legacy ? legacyChecksum(record) : computeSnapshotChecksum({ schemaVersion, digestVersion, record })
+    const checksum = legacy ? legacyChecksum(record) : computeRecordEnvelopeChecksum({ schemaVersion, digestVersion, record })
     if (raw.checksum !== checksum || record.projectId !== projectId || record.kind !== kind
       || (id !== undefined && record.id !== id)) throw new Error()
     return Object.freeze({ ...record, digestVersion })
@@ -254,9 +215,9 @@ export async function openLocalRecordStore(directory: string, projectId: string,
     const version = digestVersion ?? previous?.digestVersion ?? currentDigestVersion
     if ((version !== legacyDigestVersion && version !== currentDigestVersion)
       || (previous && version !== previous.digestVersion)) throw new LocalStoreError('invalid-record')
-    const envelope = { schemaVersion: 'local-record-envelope/v0.2', digestVersion: version, record }
+    const envelope = { schemaVersion: 'local-record-envelope/v0.2', digestVersion: version, record } as const
     await replace(pathFor(record.kind, record.id), `${JSON.stringify({ ...envelope,
-      checksum: computeSnapshotChecksum(envelope) })}\n`)
+      checksum: computeRecordEnvelopeChecksum(envelope) })}\n`)
   }
   async function list(kind: string) {
     pathFor(kind, 'validate-id')
