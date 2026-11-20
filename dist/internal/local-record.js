@@ -1,8 +1,13 @@
+import { types } from 'node:util';
 export class LocalStoreError extends Error {
     code;
     constructor(code) { super(code); this.code = code; }
 }
 export const maxBytes = 16 * 1024 * 1024;
+export function rejectLocalProxy(value) {
+    if (types.isProxy(value))
+        throw new LocalStoreError('invalid-record');
+}
 /** Strict JSON boundary before hashing or writing a record. */
 export function copyLocalJson(value, depth = 0, budget = { nodes: 0 }) {
     if (++budget.nodes > 100_000 || depth > 32)
@@ -14,8 +19,13 @@ export function copyLocalJson(value, depth = 0, budget = { nodes: 0 }) {
     // Match the persisted JSON number before a caller can hash or meter the copy.
     if (typeof value === 'number' && Number.isFinite(value))
         return Object.is(value, -0) ? 0 : value;
+    if (typeof value !== 'object')
+        throw new LocalStoreError('invalid-record');
+    rejectLocalProxy(value);
+    const prototype = Object.getPrototypeOf(value);
     if (Array.isArray(value)) {
-        if (value.length > 50_000 || Reflect.ownKeys(value).length !== value.length + 1)
+        if (prototype !== Array.prototype || value.length > 50_000
+            || Reflect.ownKeys(value).length !== value.length + 1)
             throw new LocalStoreError('invalid-record');
         const result = [];
         for (let i = 0; i < value.length; i++) {
@@ -26,7 +36,7 @@ export function copyLocalJson(value, depth = 0, budget = { nodes: 0 }) {
         }
         return Object.freeze(result);
     }
-    if (!value || typeof value !== 'object' || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
+    if (prototype !== Object.prototype && prototype !== null) {
         throw new LocalStoreError('invalid-record');
     }
     const result = Object.create(null);

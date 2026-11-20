@@ -11,6 +11,7 @@ export type RecordBody = Readonly<{
     payload: unknown;
 }>;
 export declare const maxBytes: number;
+export declare function rejectLocalProxy(value: unknown): void;
 /** Strict JSON boundary before hashing or writing a record. */
 export declare function copyLocalJson(value: unknown, depth?: number, budget?: {
     nodes: number;

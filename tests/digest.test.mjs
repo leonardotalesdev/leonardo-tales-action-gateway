@@ -1,14 +1,37 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { readdir } from 'node:fs/promises'
 import test from 'node:test'
+import { createActionGateway } from '@leonardo-tales/action-gateway'
 import { computeSnapshotChecksum, createLegacySnapshotChecksum } from '../dist/internal/digest.js'
 import { openLocalRecordStore } from '../dist/internal/local-store.js'
-import { inLocale, workspace } from './fixture.mjs'
+import { config, first, inLocale, records, workspace } from './fixture.mjs'
 
 const digestUrl = new URL('../dist/internal/digest.js', import.meta.url).href
 const gatewayUrl = new URL('../dist/index.js', import.meta.url).href
 const fixtureUrl = new URL('./fixture.mjs', import.meta.url).href
 const sha256 = (text) => createHash('sha256').update(text, 'utf8').digest('hex')
+
+function observeProxyTraps(traps) {
+  return {
+    getPrototypeOf(target) {
+      traps.push('getPrototypeOf')
+      return Reflect.getPrototypeOf(target)
+    },
+    ownKeys(target) {
+      traps.push('ownKeys')
+      return Reflect.ownKeys(target)
+    },
+    getOwnPropertyDescriptor(target, key) {
+      traps.push('getOwnPropertyDescriptor')
+      return Reflect.getOwnPropertyDescriptor(target, key)
+    },
+    get(target, key, receiver) {
+      traps.push('get')
+      return Reflect.get(target, key, receiver)
+    },
+  }
+}
 
 test('v0.1.0 sorts Unicode keys differently in verified English and Swedish ICU collations', () => {
   const source = `
@@ -90,6 +113,109 @@ test('utf16-v1 rejects unsupported values before JSON serialization', () => {
   for (const [name, input] of cases) {
     assert.throws(() => computeSnapshotChecksum(input), { code: 'invalid-record' }, name)
   }
+})
+
+test('utf16-v1 accepts ordinary arrays and rejects custom array prototypes without calling hooks', () => {
+  let hookCalls = 0
+  class CustomArray extends Array {}
+  class SerializableArray extends Array {
+    toJSON() {
+      hookCalls++
+      return [1, 2, 3]
+    }
+  }
+  const cases = [
+    ['array subclass', new CustomArray(1, 2, 3)],
+    ['inherited toJSON', new SerializableArray(1, 2, 3)],
+    ['manually changed array prototype', Object.setPrototypeOf([1, 2, 3], null)],
+  ]
+  for (const [name, input] of cases) {
+    assert.throws(() => computeSnapshotChecksum(input), { code: 'invalid-record' }, name)
+  }
+  assert.equal(hookCalls, 0)
+  const plain = Object.assign(Object.create(null), { rows: [1, 2, 3] })
+  assert.equal(computeSnapshotChecksum(plain), sha256('{"rows":[1,2,3]}'))
+})
+
+test('utf16-v1 rejects object and array proxies before any trap runs', () => {
+  const traps = []
+  const handler = observeProxyTraps(traps)
+  const revoked = Proxy.revocable([], handler)
+  revoked.revoke()
+  const cases = [
+    ['plain object proxy', new Proxy({ rows: 1 }, handler)],
+    ['array proxy', new Proxy([1, 2, 3], handler)],
+    ['Date proxy', new Proxy(new Date(0), handler)],
+    ['revoked array proxy', revoked.proxy],
+  ]
+  for (const [name, input] of cases) {
+    assert.throws(() => computeSnapshotChecksum(input), { code: 'invalid-record' }, name)
+    assert.throws(() => computeSnapshotChecksum({ nested: [input] }), { code: 'invalid-record' }, name)
+  }
+  assert.deepEqual(traps, [])
+})
+
+test('Gateway rejects proxies and array subclasses before metering or writing state', async (t) => {
+  const directory = await workspace(t)
+  const options = config(directory)
+  const calls = { meter: 0, review: 0, handler: 0 }
+  const { amount, execute } = options.tool
+  options.tool.amount = (input) => {
+    calls.meter++
+    return amount(input)
+  }
+  options.review = async () => {
+    calls.review++
+    return 'APPROVED'
+  }
+  options.tool.execute = (...args) => {
+    calls.handler++
+    return execute(...args)
+  }
+  const gateway = await createActionGateway(options)
+  const initialEntries = await readdir(directory, { recursive: true, withFileTypes: true })
+  assert.ok(initialEntries.every((entry) => entry.isDirectory()))
+  const before = initialEntries.map((entry) => `${entry.parentPath}/${entry.name}`).sort()
+
+  class CustomArray extends Array {}
+  const traps = []
+  const handler = observeProxyTraps(traps)
+  const proxyArray = new Proxy([1, 2, 3], handler)
+  const proxyObject = new Proxy(first.input, handler)
+  const revoked = Proxy.revocable([], handler)
+  revoked.revoke()
+  const cases = [
+    ['nested array subclass', { ...first, input: { ...first.input, extra: new CustomArray(1, 2, 3) } }],
+    ['nested proxy array', { ...first, input: { ...first.input, extra: proxyArray } }],
+    ['nested proxy object', { ...first, input: { ...first.input, extra: proxyObject } }],
+    ['proxy array input', { ...first, input: proxyArray }],
+    ['proxy object input', { ...first, input: proxyObject }],
+    ['revoked proxy array input', { ...first, input: revoked.proxy }],
+    ['proxy intent', new Proxy(first, handler)],
+  ]
+  for (const [name, intent] of cases) {
+    await assert.rejects(gateway.execute(intent), { code: 'invalid-record' }, name)
+  }
+  assert.deepEqual(traps, [])
+  assert.deepEqual(calls, { meter: 0, review: 0, handler: 0 })
+  assert.equal(await gateway.inspect(first.operationKey), null)
+  assert.deepEqual(await records(directory, 'approval-requests'), [])
+  const after = await readdir(directory, { recursive: true, withFileTypes: true })
+  assert.ok(after.every((entry) => entry.isDirectory()))
+  assert.deepEqual(after.map((entry) => `${entry.parentPath}/${entry.name}`).sort(), before)
+})
+
+test('record writes reject proxied envelopes and payloads before inspecting them', async (t) => {
+  const directory = await workspace(t)
+  const projectId = 'project-digest-proxies'
+  const store = await openLocalRecordStore(directory, projectId)
+  const record = { kind: 'tasks', id: 'task-proxy', projectId, revision: 1, payload: { value: 1 } }
+  const traps = []
+  const handler = observeProxyTraps(traps)
+  await assert.rejects(store.create(new Proxy(record, handler)), { code: 'invalid-record' })
+  await assert.rejects(store.create({ ...record, payload: new Proxy(record.payload, handler) }), { code: 'invalid-record' })
+  assert.deepEqual(traps, [])
+  assert.equal(await store.read(record.kind, record.id), null)
 })
 
 test('record envelope hashing preserves existing depth and node limits for record payloads', async (t) => {

@@ -163,8 +163,9 @@ export async function createActionGateway(options: ActionGatewayOptions) {
 
     async execute(intent: Readonly<{ runId: string; operationKey: string; input: ActionInput }>): Promise<ActionReceipt> {
       const { runId, operationKey, input: supplied } = localObject(intent, ['runId', 'operationKey', 'input'])
-      if (!localId(runId) || !localId(operationKey) || !supplied || typeof supplied !== 'object' || Array.isArray(supplied)) throw new Error('invalid-action-intent')
+      if (!localId(runId) || !localId(operationKey) || !supplied || typeof supplied !== 'object') throw new Error('invalid-action-intent')
       const input = copyLocalJson(supplied) as ActionInput
+      if (Array.isArray(input)) throw new Error('invalid-action-intent')
 
       // Task metadata and the logical identity are written with the same project writer as admission.
       const prepared = await state.exclusive(async (port) => {

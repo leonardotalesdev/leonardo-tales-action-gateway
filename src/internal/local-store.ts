@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 
 import { computeRecordEnvelopeChecksum, computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion,
   type DigestVersion, type SnapshotChecksum } from './digest.js'
-import { copyLocalJson, LocalStoreError, maxBytes, type RecordBody } from './local-record.js'
+import { copyLocalJson, LocalStoreError, maxBytes, rejectLocalProxy, type RecordBody } from './local-record.js'
 
 export { copyLocalJson, LocalStoreError, type LocalStoreErrorCode } from './local-record.js'
 export type LocalRecord = RecordBody & Readonly<{ digestVersion: DigestVersion }>
@@ -46,6 +46,7 @@ export function localTimestamp(value: unknown): value is string {
   return Number.isFinite(date.getTime()) && date.toISOString() === value
 }
 export function localObject(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  rejectLocalProxy(value)
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw new LocalStoreError('invalid-record')
   const own = Reflect.ownKeys(value)
@@ -199,6 +200,8 @@ export async function openLocalRecordStore(directory: string, projectId: string,
     try { return decode(text, kind, id) } catch { throw new LocalStoreError('corrupt-record') }
   }
   async function write(value: RecordWrite, expected: number | null, replace: (path: string, text: string) => Promise<void>) {
+    // Checking for the optional version probes the write envelope before localObject.
+    rejectLocalProxy(value)
     const keys = value && Object.hasOwn(value, 'digestVersion') ? [...recordKeys, 'digestVersion'] : recordKeys
     const { digestVersion, ...body } = localObject(value, keys)
     const record = localRecord(body)
