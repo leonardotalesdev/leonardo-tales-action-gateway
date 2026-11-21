@@ -5,7 +5,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 import { createActionGateway } from '@leonardo-tales/action-gateway'
-import { config, first, second, third, records, workspace } from './fixture.mjs'
+import { config, first, second, third, persistedFiles, records, workspace } from './fixture.mjs'
 
 const worker = new URL('./worker.mjs', import.meta.url)
 const effects = (directory) => readFile(join(directory, 'effects'), 'utf8')
@@ -29,11 +29,18 @@ test('exactly approved actions charge one Task across Runs and stop at its hard 
 test('a new Run replays the original result and changed arguments conflict without dispatch', async (t) => {
   const options = config(await workspace(t))
   const original = await (await createActionGateway(options)).execute(first)
+  matches(original, {
+    taskId: options.task.id, runId: first.runId, operationKey: first.operationKey,
+    decision: 'EXECUTED', evidenceId: 'effect-a', cap: 10, settled: 4, held: 0, remaining: 6,
+  })
+  const before = await persistedFiles(options.directory)
   const reopened = await createActionGateway(options)
+  assert.deepEqual(await reopened.inspect(first.operationKey), original)
   assert.deepEqual(await reopened.execute({ ...first, runId: 'later' }), { ...original, replayed: true })
   for (const input of [{ rows: 4, batch: 'changed' }, { rows: 0 }]) {
     matches(await reopened.execute({ ...first, input }), { decision: 'CONFLICT', reason: 'operation-conflict' })
   }
+  assert.deepEqual(await persistedFiles(options.directory), before)
   assert.equal(await effects(options.directory), '4\n')
 })
 
@@ -79,17 +86,35 @@ test('the meter, exact approval, stored proposal and resumed handler see canonic
 
 test('pending approval cannot transfer Runs and serialized receipts and decisions have no authority', async (t) => {
   const options = config(await workspace(t))
-  const gateway = await createActionGateway({ ...options, review: async () => 'PENDING' })
+  const reviews = []
+  const gateway = await createActionGateway({ ...options, review: async (request) => { reviews.push(request); return 'PENDING' } })
   const pending = await gateway.execute(first)
-  matches(pending, { decision: 'APPROVAL_REQUIRED', remaining: 10 })
+  matches(pending, {
+    taskId: options.task.id, runId: first.runId, operationKey: first.operationKey,
+    decision: 'APPROVAL_REQUIRED', settled: 0, held: 0, remaining: 10, evidenceId: null, replayed: false,
+  })
   assert.ok(!JSON.stringify(pending).includes('"batch"'))
-  for (const extra of [{ approval: 'APPROVED' }, { amount: 1 }, pending]) {
+  const before = await persistedFiles(options.directory)
+  for (const extra of [{ approval: 'APPROVED' }, { amount: 1 }, JSON.parse(JSON.stringify(pending))]) {
     await assert.rejects(() => gateway.execute({ ...first, ...extra }))
   }
-  const reopened = await createActionGateway(options)
-  matches(await reopened.execute({ ...first, runId: 'renamed' }), { reason: 'operation-bound-to-original-run' })
+  const reopened = await createActionGateway({ ...options, review: async (request) => { reviews.push(request); return 'APPROVED' } })
+  assert.deepEqual(await reopened.inspect(first.operationKey), pending)
+  const [{ envelope: { record: task } }] = await records(options.directory, 'tasks')
+  const [{ envelope: { record: run } }] = await records(options.directory, 'runs')
+  const [{ envelope: { record: request } }] = await records(options.directory, 'approval-requests')
+  matches(run.payload, { taskId: task.id, projectId: task.projectId, status: 'awaiting-approval' })
+  matches(request.payload.binding, { taskId: task.id, projectId: task.projectId, runId: run.id })
+  matches(await reopened.execute({ ...first, runId: 'renamed' }), {
+    decision: 'BLOCKED', reason: 'operation-bound-to-original-run', runId: first.runId, settled: 0, held: 0,
+  })
+  assert.equal(reviews.length, 1)
+  assert.deepEqual(await persistedFiles(options.directory), before)
   await assert.rejects(() => effects(options.directory), { code: 'ENOENT' })
-  matches(await reopened.execute(first), { decision: 'EXECUTED', approvalRequestId: pending.approvalRequestId })
+  matches(await reopened.execute(first), { decision: 'EXECUTED', approvalRequestId: pending.approvalRequestId, settled: 4 })
+  assert.equal(reviews.length, 2)
+  assert.deepEqual(reviews[1], reviews[0])
+  assert.equal(await effects(options.directory), '4\n')
 })
 
 test('reopening cannot change a Task cap, meter charge, unit, operator or action revision', async (t) => {
@@ -111,8 +136,14 @@ test('a denied exact request stays denied after restart', async (t) => {
   const options = config(await workspace(t))
   const gateway = await createActionGateway({ ...options, review: async () => 'DENIED' })
   const denied = await gateway.execute(first)
-  matches(denied, { decision: 'BLOCKED', reason: 'approval-denied', remaining: 10 })
-  assert.deepEqual(await (await createActionGateway(options)).execute(first), { ...denied, replayed: true })
+  matches(denied, { decision: 'BLOCKED', reason: 'approval-denied', settled: 0, held: 0, remaining: 10, evidenceId: null })
+  const [{ envelope: { record: approval } }] = await records(options.directory, 'approval-decisions')
+  matches(approval.payload, { decision: 'DENIED', requestId: denied.approvalRequestId, approverId: options.approverId })
+  const before = await persistedFiles(options.directory)
+  const reopened = await createActionGateway(options)
+  assert.deepEqual(await reopened.inspect(first.operationKey), denied)
+  assert.deepEqual(await reopened.execute({ ...first, runId: 'retry-denial' }), { ...denied, replayed: true })
+  assert.deepEqual(await persistedFiles(options.directory), before)
   await assert.rejects(() => effects(options.directory), { code: 'ENOENT' })
 })
 
@@ -211,13 +242,34 @@ test('a lost handler response retains exposure even after the handler produced a
 test('real process exit after a synced effect preserves the hold and refuses blind redispatch', { timeout: 15_000 }, async (t) => {
   const directory = await workspace(t)
   const child = fork(worker, [directory, 'crash'])
-  const [code] = await once(child, 'exit')
-  assert.equal(code, 77)
-  const reopened = await createActionGateway(config(directory))
-  matches(await reopened.inspect(first.operationKey), { decision: 'UNKNOWN', held: 4, settled: 0, remaining: 6 })
-  matches(await reopened.execute({ ...first, runId: 'after-crash' }), { decision: 'UNKNOWN', replayed: true })
-  matches(await reopened.execute({ ...second, input: { rows: 7 } }), { reason: 'task_limit', held: 4 })
-  assert.equal(await effects(directory), '4\n')
+  const exit = once(child, 'exit')
+  try {
+    const [code] = await exit
+    assert.equal(code, 77)
+    const [{ envelope: { record: attempt } }] = await records(directory, 'gateway-attempts')
+    const [{ envelope: { record: execution } }] = await records(directory, 'execution')
+    matches(attempt.payload, { phase: 'reserved', result: null })
+    matches(execution.payload, { status: 'execution_started', runId: attempt.payload.binding.runId })
+    const before = await persistedFiles(directory)
+    const options = config(directory)
+    const reopened = await createActionGateway(options)
+    const interrupted = await reopened.inspect(first.operationKey)
+    matches(interrupted, {
+      taskId: options.task.id, runId: first.runId, operationKey: first.operationKey,
+      decision: 'UNKNOWN', reason: 'reconciliation-required', evidenceId: null,
+      cap: 10, held: 4, settled: 0, remaining: 6,
+    })
+    assert.deepEqual(await reopened.execute({ ...first, runId: 'after-crash' }), { ...interrupted, replayed: true })
+    matches(await reopened.execute({ ...first, input: { ...first.input, batch: 'changed' } }), {
+      decision: 'CONFLICT', reason: 'operation-conflict', held: 4,
+    })
+    assert.deepEqual(await persistedFiles(directory), before)
+    matches(await reopened.execute({ ...second, input: { rows: 7 } }), { reason: 'task_limit', held: 4 })
+    assert.equal(await effects(directory), '4\n')
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill()
+    await exit
+  }
 })
 
 test('an older refusal with no recorded balance stays blocked', async (t) => {

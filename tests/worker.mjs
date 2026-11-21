@@ -2,6 +2,7 @@ import { open } from 'node:fs/promises'
 import { join } from 'node:path'
 import { once } from 'node:events'
 import { createActionGateway } from '@leonardo-tales/action-gateway'
+import { openLocalRecordStore } from '../dist/internal/local-store.js'
 import { config, first, second } from './fixture.mjs'
 
 const [directory, mode] = process.argv.slice(2)
@@ -38,6 +39,16 @@ if (mode === 'crash') {
   }
   const gateway = await createActionGateway(options)
   await gateway.execute({ runId: key, operationKey: key, input: { rows: 2, batch: key } })
+  process.disconnect()
+} else if (mode === 'writer-lock') {
+  const projectId = process.argv[4]
+  const store = await openLocalRecordStore(join(directory, 'state'), projectId)
+  await store.exclusive(async (port) => {
+    const manifest = await port.read('action-allowance', 'task-allowance')
+    const release = once(process, 'message')
+    process.send({ status: 'owns-writer-lock', manifestRevision: manifest?.revision })
+    await release
+  })
   process.disconnect()
 } else {
   throw new Error('unexpected worker mode')

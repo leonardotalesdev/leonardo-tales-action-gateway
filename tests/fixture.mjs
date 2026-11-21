@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { appendFile, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 
 export const time = '2030-01-01T00:00:00.000Z'
 export const first = { runId: 'run-a', operationKey: 'export-1', input: { rows: 4, batch: 'a' } }
@@ -43,10 +43,23 @@ export function config(directory) {
   }
 }
 
+export async function projectDirectory(directory, area) {
+  const base = join(directory, area)
+  const [project] = await readdir(base)
+  return join(base, project)
+}
+
+export async function persistedFiles(directory) {
+  const entries = await readdir(directory, { recursive: true, withFileTypes: true })
+  return Object.fromEntries(await Promise.all(entries.filter((entry) => entry.isFile()).map(async (entry) => {
+    const path = join(entry.parentPath, entry.name)
+    return [relative(directory, path), await readFile(path)]
+  })))
+}
+
 // Read the actual persisted envelopes independently of the product read path.
 export async function records(directory, kind) {
-  const [project] = await readdir(join(directory, 'state'))
-  const collection = join(directory, 'state', project, kind)
+  const collection = join(await projectDirectory(directory, 'state'), kind)
   const names = (await readdir(collection)).filter((name) => name.endsWith('.json'))
   return Promise.all(names.map(async (name) => {
     const path = join(collection, name)
