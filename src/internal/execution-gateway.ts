@@ -82,7 +82,7 @@ function parseAttempt(record: LocalRecord, projectId: string, hash: SnapshotChec
   if (raw.phase === 'closed' && (!raw.result || resultValue(raw.result).status === 'unknown' || raw.pendingEvents.length !== 0)) fail('invalid-record')
   return { record, value: raw as unknown as Attempt }
 }
-async function loadAttempt(port: LocalRecordPort, exact: ExactActionBinding, version: DigestVersion) {
+export async function loadAttempt(port: Pick<LocalRecordPort, 'read' | 'checksumFor'>, exact: ExactActionBinding, version: DigestVersion) {
   const record = await port.read('gateway-attempts', exact.executionId)
   if (!record) return null
   if (record.digestVersion !== version) fail('invalid-record')

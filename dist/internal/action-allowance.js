@@ -106,5 +106,5 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
             payload: { ...payload, binding, ...decision } }, 1);
         return admitted;
     }
-    return { verifyManifest, read, register, snapshot, reserve };
+    return { verifyManifest, read, register, snapshot, reserve, parseOperation: parse };
 }

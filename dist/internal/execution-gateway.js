@@ -84,7 +84,7 @@ function parseAttempt(record, projectId, hash) {
         fail('invalid-record');
     return { record, value: raw };
 }
-async function loadAttempt(port, exact, version) {
+export async function loadAttempt(port, exact, version) {
     const record = await port.read('gateway-attempts', exact.executionId);
     if (!record)
         return null;

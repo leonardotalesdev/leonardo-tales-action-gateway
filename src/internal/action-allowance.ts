@@ -121,5 +121,5 @@ export function createTaskAllowance(projectId: string, taskId: string, cap: numb
     return admitted
   }
 
-  return { verifyManifest, read, register, snapshot, reserve }
+  return { verifyManifest, read, register, snapshot, reserve, parseOperation: parse }
 }

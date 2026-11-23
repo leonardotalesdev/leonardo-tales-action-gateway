@@ -1,6 +1,6 @@
 import { type DigestVersion } from './digest.js';
 import type { ExactActionBinding } from './gateway-contract.js';
-import { type LocalRecordPort } from './local-store.js';
+import { type LocalRecord, type LocalRecordPort } from './local-store.js';
 export type RefusalBalance = Readonly<{
     reason: 'task_limit';
     cap: number;
@@ -53,4 +53,17 @@ export declare function createTaskAllowance(projectId: string, taskId: string, c
         } | undefined;
     }>;
     reserve: (port: LocalRecordPort, key: string, binding: ExactActionBinding, version: DigestVersion) => Promise<boolean>;
+    parseOperation: (record: LocalRecord) => Readonly<{
+        digestVersion: DigestVersion;
+        key: string;
+        runId: string;
+        runRevision: number;
+        createdAt: string;
+        inputDigest: string;
+        proposalDigest: string;
+        amount: number;
+        phase: "pending" | "held" | "blocked";
+        binding: ExactActionBinding | null;
+        refusalBasis?: RefusalBalance;
+    }>;
 };
