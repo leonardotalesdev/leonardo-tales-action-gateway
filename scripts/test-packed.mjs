@@ -21,7 +21,7 @@ try {
   await mkdir(consumer)
   const [pack] = JSON.parse(run('npm', ['pack', '--json', '--pack-destination', scratch], root))
   assert.equal(pack.name, name)
-  assert.equal(pack.version, '0.1.0')
+  assert.equal(pack.version, '0.1.1')
   assert.ok(pack.files.every(({ path }) => /^(dist\/[^/].*\.(js|d\.ts)|LICENSE|LICENSES\/Apache-2.0\.txt|README\.md|package\.json|examples\/row-export\/index\.mjs)$/.test(path)))
   for (const path of ['LICENSE', 'LICENSES/Apache-2.0.txt', 'dist/index.js', 'dist/index.d.ts', 'examples/row-export/index.mjs']) {
     assert.ok(pack.files.some((file) => file.path === path), path)

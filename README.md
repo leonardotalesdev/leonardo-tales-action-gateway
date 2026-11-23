@@ -89,7 +89,7 @@ npm run test:packed
 
 ## Origin and distribution
 
-Version 0.1.0 supports Linux and Node.js 22.18 or later. Extracted from the Leonardo Tales Core governance and execution research program.
+Version 0.1.1 supports Linux and Node.js 22.18 or later. Extracted from the Leonardo Tales Core governance and execution research program.
 
 Maintained by Hakan Demirci. Copyright 2026 Hakan Demirci for maintainer-owned Action Gateway contributions.
 

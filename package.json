@@ -1,6 +1,6 @@
 {
   "name": "@leonardo-tales/action-gateway",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "description": "Local TypeScript execution gateway for consequential AI agent actions with exact approval, Task-scoped limits, replay-safe execution, crash-aware recovery, and inspectable receipts.",
   "author": "Hakan Demirci",
