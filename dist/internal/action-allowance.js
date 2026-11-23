@@ -1,22 +1,24 @@
 import { computeSnapshotChecksum as digest } from './digest.js';
+import { projectManifest } from './store-manifest.js';
 import { readClosedExecution } from './execution-gateway.js';
-import { actionAllowanceKind as kind, localId, localObject, localRevision, localTimestamp } from './local-store.js';
-const manifestId = 'task-allowance';
+import { actionAllowanceKind as kind, localId, localObject, localRevision, localTimestamp, taskManifestId as manifestId } from './local-store.js';
 export function operationId(key) { return `operation-${digest(key)}`; }
 export function nativeRunId(id) { return `run-${digest(id)}`; }
 export function positiveInteger(value) {
     return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 export function createTaskAllowance(projectId, taskId, cap, manifest) {
-    async function verifyManifest(port, initialize = false) {
+    async function verifyManifest(port, mode = 'existing') {
         const record = await port.read(kind, manifestId);
-        if (!record && initialize) {
-            if ((await port.list(kind)).length)
+        if (!record) {
+            if (mode === 'existing' || (await port.list(kind)).length)
                 throw new Error('missing-task-allowance');
-            await port.create({ kind, projectId, id: manifestId, revision: 1, payload: manifest });
+            if (mode === 'initialize')
+                await port.create({ kind, projectId, id: manifestId, revision: 1, payload: manifest });
             return;
         }
-        if (record?.revision !== 1 || digest(record.payload) !== digest(manifest))
+        const { configuration } = projectManifest(record, projectId, port.checksumFor);
+        if (digest(configuration) !== digest(manifest))
             throw new Error('task-configuration-conflict');
     }
     function parse(record) {

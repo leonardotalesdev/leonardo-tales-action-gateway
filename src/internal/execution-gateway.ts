@@ -92,7 +92,8 @@ export async function loadAttempt(port: Pick<LocalRecordPort, 'read' | 'checksum
 }
 
 /** Positive terminal evidence for a particular durable reservation, never a dispatch permit. */
-export async function readClosedExecution(port: LocalRecordPort, binding: ExactActionBinding, version: DigestVersion) {
+export async function readClosedExecution(port: Pick<LocalRecordPort, 'read' | 'checksumFor'>,
+  binding: ExactActionBinding, version: DigestVersion) {
   const attempt = await loadAttempt(port, binding, version)
   return attempt?.value.phase === 'closed' ? attempt.value.result : null
 }

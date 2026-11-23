@@ -1,5 +1,5 @@
 import { lstat } from 'node:fs/promises'
-import { isAbsolute, join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { createTaskRunStore } from './task-run-store.js'
 import { createTask, createRun, getRunNextAction, transitionRun, type Run, type Task } from './task-run.js'
 import { validateActionProposal, type ActionDefinition, type ActionInput } from './action-contract.js'
@@ -8,9 +8,9 @@ import { createTrustedExecutionGateway, parseStoredProposal } from './execution-
 import { approvalDecisionId, parseApprovalDecision, parseApprovalRequest } from './gateway-approval.js'
 import { ExecutionGatewayError, type ExactApprovalRequest, type GatewayAction } from './gateway-contract.js'
 import { computeSnapshotChecksum as digest, currentDigestVersion } from './digest.js'
-import { copyLocalJson, localId, localObject, localTimestamp, openLocalAuditPort, openLocalRecordStore, type LocalRecordPort } from './local-store.js'
+import { copyLocalJson, localId, localObject, localTimestamp, openLocalAuditPort, openLocalRecordStore, canonicalGatewayPath, type LocalRecordPort } from './local-store.js'
 
-type TaskSettings = Readonly<{ id: string; cap: number; unit: string; expiresAt: string }>
+import { taskStoreIdentity, type TaskSettings } from './store-manifest.js'
 type Decision = 'APPROVED' | 'DENIED' | 'PENDING'
 export type ActionReview = Readonly<{
   taskId: string; runId: string; operationKey: string; action: string; input: ActionInput
@@ -50,9 +50,7 @@ export async function createActionGateway(options: ActionGatewayOptions) {
   const { directory, approverId, review, timeoutMs = 10_000, now = () => new Date().toISOString() } = options
   const task = copyLocalJson(options.task) as TaskSettings
   const { id: action, revision, amount: measure, execute: handler } = options.tool
-  const projectId = `project-action-${digest(task.id)}` as const
-  const taskId = `task-action-${digest(task.id)}` as const
-  if (!isAbsolute(directory) || resolve(directory) !== directory || directory === '/'
+  if (!canonicalGatewayPath(directory)
     || !localId(task.id) || !localId(task.unit) || !positiveInteger(task.cap) || !localTimestamp(task.expiresAt)
     || !localId(approverId) || !localId(action) || !/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(action)
     || !positiveInteger(revision) || !positiveInteger(timeoutMs) || timeoutMs > 30_000
@@ -60,6 +58,7 @@ export async function createActionGateway(options: ActionGatewayOptions) {
   localObject(task, ['id', 'cap', 'unit', 'expiresAt'])
   const stat = await lstat(directory)
   if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) throw new Error('unsafe-action-gateway-directory')
+  const { projectId, taskId } = taskStoreIdentity(task.id)
   const manifest = { schemaVersion: 'action-allowance/v0.1', task, action, revision, approverId, timeoutMs }
   const state = await openLocalRecordStore(join(directory, 'state'), projectId, { legacyDigestLocale: options.legacyDigestLocale })
   const audit = await openLocalAuditPort(join(directory, 'audit'), projectId)
@@ -156,9 +155,8 @@ export async function createActionGateway(options: ActionGatewayOptions) {
     async inspect(operationKey: string): Promise<ActionReceipt | null> {
       if (!localId(operationKey)) throw new Error('invalid-operation-key')
       const value = await allowance.read(state, operationKey)
-      if (!value) return null
-      await allowance.verifyManifest(state)
-      return receipt(operationKey)
+      await allowance.verifyManifest(state, value ? 'existing' : 'inspect')
+      return value ? receipt(operationKey) : null
     },
 
     async execute(intent: Readonly<{ runId: string; operationKey: string; input: ActionInput }>): Promise<ActionReceipt> {
@@ -169,7 +167,7 @@ export async function createActionGateway(options: ActionGatewayOptions) {
 
       // Task metadata and the logical identity are written with the same project writer as admission.
       const prepared = await state.exclusive(async (port) => {
-        await allowance.verifyManifest(port, true)
+        await allowance.verifyManifest(port, 'initialize')
         const existing = await allowance.read(port, operationKey)
         const digestVersion = existing?.digestVersion ?? currentDigestVersion
         const hash = port.checksumFor(digestVersion)

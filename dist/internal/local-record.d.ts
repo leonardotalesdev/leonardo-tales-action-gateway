@@ -1,4 +1,4 @@
-export type LocalStoreErrorCode = 'invalid-record' | 'invalid-id' | 'unsafe-path' | 'locked' | 'already-exists' | 'stale-revision' | 'corrupt-record' | 'write-uncertain' | 'io-error';
+export type LocalStoreErrorCode = 'invalid-record' | 'invalid-id' | 'unsafe-path' | 'locked' | 'legacy-digest-locale-required' | 'already-exists' | 'stale-revision' | 'corrupt-record' | 'write-uncertain' | 'io-error';
 export declare class LocalStoreError extends Error {
     readonly code: LocalStoreErrorCode;
     constructor(code: LocalStoreErrorCode);

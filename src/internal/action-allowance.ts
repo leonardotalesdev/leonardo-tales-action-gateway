@@ -1,8 +1,11 @@
 import { computeSnapshotChecksum as digest, type DigestVersion } from './digest.js'
+import { projectManifest } from './store-manifest.js'
 import { readClosedExecution } from './execution-gateway.js'
 import type { ExactActionBinding } from './gateway-contract.js'
-import { actionAllowanceKind as kind, localId, localObject, localRevision, localTimestamp,
+import { actionAllowanceKind as kind, localId, localObject, localRevision, localTimestamp, taskManifestId as manifestId,
   type LocalRecord, type LocalRecordPort } from './local-store.js'
+
+type AllowanceReadPort = Pick<LocalRecordPort, 'read' | 'list' | 'checksumFor'>
 
 export type RefusalBalance = Readonly<{
   reason: 'task_limit'; cap: number; settled: number; held: number; remaining: number
@@ -22,8 +25,6 @@ export type Operation = Readonly<{
   refusalBasis?: RefusalBalance
 }>
 
-const manifestId = 'task-allowance'
-
 export function operationId(key: string) { return `operation-${digest(key)}` }
 export function nativeRunId(id: string): `run-${string}` { return `run-${digest(id)}` }
 export function positiveInteger(value: unknown): value is number {
@@ -31,14 +32,15 @@ export function positiveInteger(value: unknown): value is number {
 }
 
 export function createTaskAllowance(projectId: string, taskId: string, cap: number, manifest: object) {
-  async function verifyManifest(port: LocalRecordPort, initialize = false) {
+  async function verifyManifest(port: LocalRecordPort, mode: 'existing' | 'initialize' | 'inspect' = 'existing') {
     const record = await port.read(kind, manifestId)
-    if (!record && initialize) {
-      if ((await port.list(kind)).length) throw new Error('missing-task-allowance')
-      await port.create({ kind, projectId, id: manifestId, revision: 1, payload: manifest })
+    if (!record) {
+      if (mode === 'existing' || (await port.list(kind)).length) throw new Error('missing-task-allowance')
+      if (mode === 'initialize') await port.create({ kind, projectId, id: manifestId, revision: 1, payload: manifest })
       return
     }
-    if (record?.revision !== 1 || digest(record.payload) !== digest(manifest)) throw new Error('task-configuration-conflict')
+    const { configuration } = projectManifest(record, projectId, port.checksumFor)
+    if (digest(configuration) !== digest(manifest)) throw new Error('task-configuration-conflict')
   }
 
   function parse(record: LocalRecord) {
@@ -78,11 +80,11 @@ export function createTaskAllowance(projectId: string, taskId: string, cap: numb
     return port.create({ kind, projectId, id: operationId(value.key), revision: 1, payload: value, digestVersion })
   }
 
-  async function outcome(port: LocalRecordPort, value: Operation) {
+  async function outcome(port: AllowanceReadPort, value: Operation) {
     return value.phase === 'held' ? await readClosedExecution(port, value.binding!, value.digestVersion) : null
   }
 
-  async function snapshot(port: LocalRecordPort, key?: string) {
+  async function snapshot(port: AllowanceReadPort, key?: string) {
     let remaining = cap
     let settled = 0
     let held = 0

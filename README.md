@@ -63,6 +63,27 @@ The gateway reads v0.1.0 records automatically when the runtime's default Node/I
 
 Stop v0.1.0 writers before opening the directory with the updated gateway. If the host locale changed, configure the original collation with `legacyDigestLocale`, for example `'sv-SE'`. The gateway verifies legacy records with one configured collation. If validation fails, keep the original directory and recover the original Node/ICU runtime and locale before retrying. A store with incompatible legacy collations or one whose original collation cannot be reproduced requires maintainer-assisted recovery. The original v0.1.0 release cannot open records written in the new envelope format.
 
+## Offline Task store promotion
+
+The installed package includes an operator command for explicitly upgrading an existing Task store from manifest revision 1 to revision 2.
+
+```sh
+./node_modules/.bin/lt-action-gateway-promote-r2 \
+  --directory /absolute/private/gateway-root --task-id case-17
+```
+
+Before running it, stop new admission and workers, disable service restart loops, and drain or terminate callbacks and continuations that could resume against the Task store. Keep that maintenance fence through verification and crash assessment. Either writer lock blocks promotion. Free locks cannot establish quiescence. The command leaves abandoned locks and temporary files for operator assessment.
+
+For a Task with legacy digest evidence, pass the original Node/ICU collation with `--legacy-digest-locale sv-SE` (substitute the historical locale as appropriate). An omitted required locale or a checksum mismatch refuses promotion before any store write. The command uses one explicit locale, with no ambient fallback. Deterministic evidence uses `utf16-v1` regardless of the option. After promotion, continue to supply the normal Gateway's `legacyDigestLocale` when needed to read historical evidence.
+
+Promotion replaces the canonical manifest atomically and preserves the parsed, verified revision-1 envelope and historical checksum in `sourceManifest`. The other durable business and audit files retain their original bytes. On success stdout reports the installed generation. Repeating the command returns that generation without replacing the manifest. On failure the command exits nonzero and reports a bounded reason on stderr. A crash can leave a lock and an uncertain outcome. Keep the fence until the original process is known to be stopped and the canonical store can be assessed.
+
+An interruption before proposal persistence can leave a pending operation with recorded input and proposal digests but no stored preimage. Promotion preserves those digests without independently verifying the missing preimage. The operation remains ineligible for reconciliation. On resume, the Gateway recomputes both digests from the supplied input and checks them against the recorded values. Changed input conflicts.
+
+A generation identifies a store lineage. Independently promoted revision-1 copies receive independent random generations. A copy of a promoted store retains the generation, and restoring an older snapshot can roll it back. Promotion carries no authority to reconcile outcomes, alter accounting, or retry an operation.
+
+The original published v0.1.1 binary rejects known-key inspection, replay, and fresh execution once they reach the revision-2 manifest fence. Factory construction may succeed and create missing collection directories. Missing-key inspection can return `null`, and old execution can create and remove a transient state lock before refusal. Reopen promoted stores using the R2-capable build.
+
 ## Scope and recovery
 
 - The trusted host must control the only route to the handler and its credential. The host assigns Task and operation identities, owns the cap, and authenticates the approver. Expose only ordinary input arguments to an agent. Creating another Task or choosing another store creates an independent allowance.

@@ -1,4 +1,4 @@
-import { createTaskAllowance, operationId, positiveInteger } from './action-allowance.js'
+import { createTaskAllowance, operationId } from './action-allowance.js'
 import type { ActionDefinition, ActionTarget } from './action-contract.js'
 import { computeSnapshotChecksum as digest, currentDigestVersion, legacyDigestVersion, type DigestVersion } from './digest.js'
 import { readExecutionAudit, type ExecutionAuditEvent, type ExecutionAuditPort } from './execution-audit.js'
@@ -7,7 +7,8 @@ import { validateExecutionState } from './execution-state.js'
 import { approvalDecisionId, parseApprovalDecision, parseApprovalRequest } from './gateway-approval.js'
 import type { ActionPolicyProfile, ExactActionBinding } from './gateway-contract.js'
 import { policyInput } from './gateway-policy.js'
-import { actionAllowanceKind, copyLocalJson, localId, localObject, localRevision, localTimestamp, type LocalRecordPort } from './local-store.js'
+import { actionAllowanceKind, copyLocalJson, localId, localObject, taskManifestId, type LocalRecordPort } from './local-store.js'
+import { projectManifest, taskStoreIdentity } from './store-manifest.js'
 import { restoreRun, restoreTask } from './task-run-store.js'
 
 type ReadState = Pick<LocalRecordPort, 'read' | 'checksumFor'>
@@ -41,10 +42,10 @@ type SubjectResult =
   }>
 
 const gatewayActor = 'action-gateway-host'
-const gatewayAgent = { id: gatewayActor, revision: 1 }
+export const gatewayAgent = { id: gatewayActor, revision: 1 }
 
 // Pin the v0.1.1 host definition and profile for historical verification.
-function historicalDefinition(actionRef: ExactActionBinding['actionRef']): ActionDefinition {
+export function historicalDefinition(actionRef: ExactActionBinding['actionRef']): ActionDefinition {
   return {
     ...actionRef, category: 'local-action', description: 'Trusted host registered action', requiredCapability: 'local-action',
     targetKind: 'logical-operation', targetInputField: 'operationKey', riskLevel: 'medium', sideEffect: 'execute',
@@ -54,7 +55,7 @@ function historicalDefinition(actionRef: ExactActionBinding['actionRef']): Actio
   }
 }
 
-const historicalProfile: ActionPolicyProfile = {
+export const historicalProfile: ActionPolicyProfile = {
   id: 'action-gateway-local', revision: 1, permissionTier: 2,
   flags: { involvesSecrets: false, involvesProduction: false, involvesExternalIntegration: false, involvesRealUserData: false,
     involvesFinancialOrLegalOrHealthData: false, proposesCommitOrPush: false, proposesDeployment: false, proposesPublicClaim: false },
@@ -119,18 +120,12 @@ export async function readReconciliationSubject(
 
     const operationRow = await read(actionAllowanceKind, operationId(operationKey))
     if (!operationRow) return refuse('missing-operation')
-    const manifestRow = await read(actionAllowanceKind, 'task-allowance')
-    requireHistory(manifestRow?.revision === 1)
-    const manifest = localObject(manifestRow.payload, ['schemaVersion', 'task', 'action', 'revision', 'approverId', 'timeoutMs'])
-    const taskSpec = localObject(manifest.task, ['id', 'cap', 'unit', 'expiresAt'])
-    requireHistory(manifest.schemaVersion === 'action-allowance/v0.1' && localId(taskSpec.id)
-      && positiveInteger(taskSpec.cap) && localId(taskSpec.unit) && localTimestamp(taskSpec.expiresAt)
-      && localId(manifest.action) && /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(manifest.action)
-      && localRevision(manifest.revision) && localId(manifest.approverId)
-      && positiveInteger(manifest.timeoutMs) && manifest.timeoutMs <= 30_000)
-    const taskHash = digest(taskSpec.id)
-    const taskId = `task-action-${taskHash}`
-    requireHistory(projectId === `project-action-${taskHash}`)
+    const manifestRow = await read(actionAllowanceKind, taskManifestId)
+    requireHistory(manifestRow)
+    const { configuration: manifest, storeGeneration } = projectManifest(manifestRow, projectId,
+      (version) => state.checksumFor(version))
+    const taskSpec = manifest.task
+    const { taskId } = taskStoreIdentity(taskSpec.id)
     const allowance = createTaskAllowance(projectId, taskId, taskSpec.cap, manifest)
     const operation = allowance.parseOperation(operationRow)
     requireHistory(operation.key === operationKey)
@@ -158,7 +153,7 @@ export async function readReconciliationSubject(
     const definition = historicalDefinition(actionRef)
     const { riskLevel, sideEffect, auditRequired, approvalMayBeRequired } = definition
     const target = { kind: definition.targetKind, resource: operationKey }
-    const scope = { id: `scope-${hash(manifestRow.payload)}`, revision: 1, projectId, taskId,
+    const scope = { id: `scope-${hash(manifest)}`, revision: 1, projectId, taskId,
       runId: binding.runId, agentRef: gatewayAgent, expiresAt: taskSpec.expiresAt }
     localObject(proposal, ['schemaVersion', 'id', 'revision', 'projectId', 'taskId', 'runId', 'runRevision',
       'agentRef', 'actionRef', 'input', 'target', 'createdAt', 'category', 'riskContext', 'executionAvailable'])
@@ -237,15 +232,20 @@ export async function readReconciliationSubject(
       inputDigest: operation.inputDigest, proposalDigest: operation.proposalDigest, binding,
       approvalRequestId: request.id, approvalRequestDigest: decision.requestDigest, approvalDecisionId: decision.id,
       target, amount, unit: taskSpec.unit, attemptId: attempt.record.id,
-      revisions: { manifest: manifestRow.revision, operation: operationRow.revision, proposal: proposalRow.revision,
+      revisions: { manifest: 1, operation: operationRow.revision, proposal: proposalRow.revision,
         request: requestRow.revision, decision: decisionRow.revision },
     } satisfies ReconciliationSubject) as ReconciliationSubject
     const subjectDigest = digest({ domain: 'action-gateway/reconciliation-subject/v1', subject })
-    const expectedState = digest({
+    const historicalState = digest({
       domain: 'action-gateway/reconciliation-state/v1', subjectDigest,
       operation: digest(operationRow.payload), attempt: digest(attempt.record), execution: digest(execution),
       run: { revision: run.revision, events: tail },
       approval: digest(decision), auditAnchors,
+    })
+    const latest = await read(actionAllowanceKind, taskManifestId)
+    requireHistory(latest && same(latest, manifestRow))
+    const expectedState = storeGeneration === null ? historicalState : digest({
+      domain: 'action-gateway/reconciliation-state/v2', manifestRevision: 2, storeGeneration, historicalState,
     })
     return Object.freeze({ status: 'eligible', observedPrefix: attempt.value.phase, subject, subjectDigest, expectedState })
   } catch {

@@ -17,6 +17,7 @@
   "exports": {
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
   },
+  "bin": { "lt-action-gateway-promote-r2": "./dist/cli/promote-r2.js" },
   "files": ["dist", "examples/row-export/index.mjs", "README.md", "LICENSE", "LICENSES"],
   "scripts": {
     "build": "tsc -p tsconfig.json",

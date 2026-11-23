@@ -1,11 +1,6 @@
 import { type ActionInput } from './action-contract.js';
 import { type RefusalBalance } from './action-allowance.js';
-type TaskSettings = Readonly<{
-    id: string;
-    cap: number;
-    unit: string;
-    expiresAt: string;
-}>;
+import { type TaskSettings } from './store-manifest.js';
 type Decision = 'APPROVED' | 'DENIED' | 'PENDING';
 export type ActionReview = Readonly<{
     taskId: string;

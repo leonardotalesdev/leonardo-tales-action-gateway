@@ -1,5 +1,6 @@
 node_modules/
 *.tgz
+!tests/fixtures/action-gateway-0.1.1.registry-tarball.tgz
 gateway-data/
 .env
 .env.*

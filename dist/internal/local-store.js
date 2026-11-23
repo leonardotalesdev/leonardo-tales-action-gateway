@@ -1,11 +1,12 @@
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { computeRecordEnvelopeChecksum, computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion } from './digest.js';
 import { copyLocalJson, LocalStoreError, maxBytes, rejectLocalProxy } from './local-record.js';
 export { copyLocalJson, LocalStoreError } from './local-record.js';
 export const actionAllowanceKind = 'action-allowance';
+export const taskManifestId = 'task-allowance';
 const kinds = ['tasks', 'runs', 'execution', 'proposals', 'approval-requests', 'approval-decisions', 'gateway-attempts', actionAllowanceKind];
 const immutableKinds = ['proposals', 'approval-requests', 'approval-decisions'];
 const recordKeys = ['kind', 'id', 'projectId', 'revision', 'payload'];
@@ -84,7 +85,7 @@ async function safeDirectory(path, create) {
             throw new LocalStoreError('unsafe-path');
     }
 }
-async function readText(path) {
+async function readBytes(path) {
     let handle;
     try {
         handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -100,19 +101,31 @@ async function readText(path) {
         const stat = await handle.stat();
         if (!stat.isFile() || stat.nlink !== 1 || stat.size > maxBytes)
             throw new LocalStoreError('unsafe-path');
-        return await handle.readFile('utf8');
+        return await handle.readFile();
     }
     finally {
         await handle.close();
     }
 }
-async function area(directory, projectId, options) {
+async function readText(path) {
+    return (await readBytes(path))?.toString('utf8') ?? null;
+}
+export function canonicalGatewayPath(path) {
+    return isAbsolute(path) && resolve(path) === path && path !== '/';
+}
+async function verifyGatewayDirectory(path) {
+    await safeDirectory(path, false);
+    const stat = await lstat(path);
+    if (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
+        throw new LocalStoreError('unsafe-path');
+}
+async function area(directory, projectId, options, create = true) {
     if (!isAbsolute(directory) || resolve(directory) !== directory || process.platform !== 'linux')
         throw new LocalStoreError('unsafe-path');
     if (!localId(projectId) || !projectId.startsWith('project-'))
         throw new LocalStoreError('invalid-id');
     const base = join(directory, computeSnapshotChecksum(projectId));
-    await safeDirectory(base, true);
+    await safeDirectory(base, create);
     const lockPath = join(base, '.writer.lock');
     async function writer(work) {
         await safeDirectory(base, false);
@@ -185,7 +198,52 @@ async function area(directory, projectId, options) {
             }
         }
     }
-    return { base, writer };
+    async function requireUnlocked() {
+        await safeDirectory(base, false);
+        try {
+            await lstat(lockPath);
+        }
+        catch (error) {
+            if (errno(error, 'ENOENT'))
+                return;
+            throw error;
+        }
+        throw new LocalStoreError('locked');
+    }
+    return { base, writer, requireUnlocked };
+}
+export function verifyRecordEnvelope(value, projectId, kind, checksumFor, id) {
+    rejectLocalProxy(value);
+    const schemaVersion = value && typeof value === 'object'
+        ? Object.getOwnPropertyDescriptor(value, 'schemaVersion')?.value : undefined;
+    const legacy = schemaVersion === 'local-record-envelope/v0.1';
+    if (!legacy && schemaVersion !== 'local-record-envelope/v0.2')
+        throw new LocalStoreError('corrupt-record');
+    const raw = localObject(value, legacy ? ['schemaVersion', 'record', 'checksum']
+        : ['schemaVersion', 'digestVersion', 'record', 'checksum']);
+    const record = localRecord(raw.record);
+    const digestVersion = legacy ? legacyDigestVersion : raw.digestVersion;
+    if (digestVersion !== legacyDigestVersion && digestVersion !== currentDigestVersion)
+        throw new LocalStoreError('corrupt-record');
+    const checksum = legacy ? checksumFor(legacyDigestVersion)(record) : computeRecordEnvelopeChecksum({ schemaVersion, digestVersion, record });
+    if (raw.checksum !== checksum || record.projectId !== projectId || record.kind !== kind
+        || (id !== undefined && record.id !== id))
+        throw new LocalStoreError('corrupt-record');
+    return { envelope: value, record: Object.freeze({ ...record, digestVersion }) };
+}
+function decodeRecord(text, projectId, kind, checksumFor, id) {
+    try {
+        return verifyRecordEnvelope(JSON.parse(text), projectId, kind, checksumFor, id);
+    }
+    catch (error) {
+        if (error instanceof LocalStoreError && error.code === 'legacy-digest-locale-required')
+            throw error;
+        throw new LocalStoreError('corrupt-record');
+    }
+}
+export function encodeRecordEnvelope(record, digestVersion = currentDigestVersion) {
+    const body = { schemaVersion: 'local-record-envelope/v0.2', digestVersion, record };
+    return { ...body, checksum: computeRecordEnvelopeChecksum(body) };
 }
 /** Explicit trusted-host storage adapter. No default path, agent tool or auto-recovery. */
 export async function openLocalRecordStore(directory, projectId, options = {}) {
@@ -207,37 +265,13 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
             throw new LocalStoreError('invalid-id');
         return join(base, kind, `${computeSnapshotChecksum(id)}.json`);
     }
-    function decode(text, kind, id) {
-        const value = JSON.parse(text);
-        const schemaVersion = value?.schemaVersion;
-        const legacy = schemaVersion === 'local-record-envelope/v0.1';
-        if (!legacy && schemaVersion !== 'local-record-envelope/v0.2')
-            throw new Error();
-        const raw = localObject(value, legacy ? ['schemaVersion', 'record', 'checksum']
-            : ['schemaVersion', 'digestVersion', 'record', 'checksum']);
-        const record = localRecord(raw.record);
-        const digestVersion = legacy ? legacyDigestVersion : raw.digestVersion;
-        if (digestVersion !== legacyDigestVersion && digestVersion !== currentDigestVersion)
-            throw new Error();
-        // v0.2 always hashes deterministically and includes the identity contract in the checksum.
-        const checksum = legacy ? legacyChecksum(record) : computeRecordEnvelopeChecksum({ schemaVersion, digestVersion, record });
-        if (raw.checksum !== checksum || record.projectId !== projectId || record.kind !== kind
-            || (id !== undefined && record.id !== id))
-            throw new Error();
-        return Object.freeze({ ...record, digestVersion });
-    }
     async function read(kind, id) {
         const path = pathFor(kind, id);
         await safeDirectory(dirname(path), false);
         const text = await readText(path);
         if (text === null)
             return null;
-        try {
-            return decode(text, kind, id);
-        }
-        catch {
-            throw new LocalStoreError('corrupt-record');
-        }
+        return decodeRecord(text, projectId, kind, checksumFor, id).record;
     }
     async function write(value, expected, replace) {
         // Checking for the optional version probes the write envelope before localObject.
@@ -255,7 +289,7 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
                 throw new LocalStoreError('invalid-record');
         }
         else {
-            if (immutableKinds.includes(record.kind))
+            if (immutableKinds.includes(record.kind) || (record.kind === actionAllowanceKind && record.id === taskManifestId))
                 throw new LocalStoreError('already-exists');
             if (!localRevision(expected) || !previous || previous.revision !== expected
                 || !localRevision(expected + 1) || record.revision !== expected + 1)
@@ -265,9 +299,7 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
         if ((version !== legacyDigestVersion && version !== currentDigestVersion)
             || (previous && version !== previous.digestVersion))
             throw new LocalStoreError('invalid-record');
-        const envelope = { schemaVersion: 'local-record-envelope/v0.2', digestVersion: version, record };
-        await replace(pathFor(record.kind, record.id), `${JSON.stringify({ ...envelope,
-            checksum: computeRecordEnvelopeChecksum(envelope) })}\n`);
+        await replace(pathFor(record.kind, record.id), `${JSON.stringify(encodeRecordEnvelope(record, version))}\n`);
     }
     async function list(kind) {
         pathFor(kind, 'validate-id');
@@ -278,7 +310,7 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
                 continue;
             const text = await readText(join(base, kind, name));
             try {
-                const record = decode(text, kind);
+                const { record } = decodeRecord(text, projectId, kind, checksumFor);
                 if (`${computeSnapshotChecksum(record.id)}.json` !== name)
                     throw new Error();
                 results.push(record);
@@ -329,4 +361,70 @@ export async function openLocalAuditPort(directory, projectId, options = {}) {
                 return line;
             });
         } });
+}
+/** Existing Task paths only. The writer can replace just the canonical manifest. */
+export async function openExistingPromotionStore(directory, projectId, checksumFor, options) {
+    if (!canonicalGatewayPath(directory))
+        throw new LocalStoreError('unsafe-path');
+    await verifyGatewayDirectory(directory);
+    const state = await area(join(directory, 'state'), projectId, options, false);
+    const audit = await area(join(directory, 'audit'), projectId, {}, false);
+    const manifestDirectory = join(state.base, actionAllowanceKind);
+    const manifestPath = join(manifestDirectory, `${computeSnapshotChecksum(taskManifestId)}.json`);
+    async function snapshot() {
+        const fingerprint = createHash('sha256');
+        const records = new Map();
+        for (const kind of kinds) {
+            const collection = join(state.base, kind);
+            let names;
+            try {
+                await safeDirectory(collection, false);
+                names = (await readdir(collection)).sort();
+            }
+            catch (error) {
+                if (!errno(error, 'ENOENT'))
+                    throw error;
+                names = [];
+            }
+            const rows = [];
+            records.set(kind, rows);
+            for (const name of names) {
+                if (!/^[a-f0-9]{64}\.json$/.test(name))
+                    continue;
+                const bytes = await readBytes(join(collection, name));
+                if (!bytes)
+                    throw new LocalStoreError('stale-revision');
+                const row = decodeRecord(bytes.toString('utf8'), projectId, kind, checksumFor);
+                if (`${computeSnapshotChecksum(row.record.id)}.json` !== name)
+                    throw new LocalStoreError('corrupt-record');
+                fingerprint.update(JSON.stringify([kind, name, bytes.length])).update(bytes);
+                rows.push(row);
+            }
+        }
+        await safeDirectory(audit.base, false);
+        const history = await readBytes(join(audit.base, 'events.jsonl'));
+        fingerprint.update(JSON.stringify(history?.length ?? null));
+        if (history)
+            fingerprint.update(history);
+        return { records, audit: history?.toString('utf8') ?? '', fingerprint: fingerprint.digest('hex') };
+    }
+    async function readManifest() {
+        await safeDirectory(manifestDirectory, false);
+        const text = await readText(manifestPath);
+        if (text === null)
+            throw new LocalStoreError('stale-revision');
+        return decodeRecord(text, projectId, actionAllowanceKind, checksumFor, taskManifestId);
+    }
+    return {
+        snapshot,
+        requireStateUnlocked: state.requireUnlocked,
+        requireAuditUnlocked: audit.requireUnlocked,
+        exclusive(work) {
+            return state.writer((replace) => work({
+                read: readManifest,
+                replace: (candidate) => replace(manifestPath, `${JSON.stringify(candidate)}\n`),
+                sync: () => syncDirectory(manifestDirectory),
+            }));
+        },
+    };
 }

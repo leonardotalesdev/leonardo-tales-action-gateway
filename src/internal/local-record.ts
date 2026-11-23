@@ -1,7 +1,7 @@
 import { types } from 'node:util'
 
 export type LocalStoreErrorCode = 'invalid-record' | 'invalid-id' | 'unsafe-path' | 'locked'
-  | 'already-exists' | 'stale-revision' | 'corrupt-record' | 'write-uncertain' | 'io-error'
+  | 'legacy-digest-locale-required' | 'already-exists' | 'stale-revision' | 'corrupt-record' | 'write-uncertain' | 'io-error'
 export class LocalStoreError extends Error {
   readonly code: LocalStoreErrorCode
   constructor(code: LocalStoreErrorCode) { super(code); this.code = code }

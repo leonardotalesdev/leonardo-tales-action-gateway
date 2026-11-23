@@ -1,7 +1,7 @@
-import type { ActionTarget } from './action-contract.js';
+import type { ActionDefinition, ActionTarget } from './action-contract.js';
 import { type DigestVersion } from './digest.js';
 import { type ExecutionAuditPort } from './execution-audit.js';
-import type { ExactActionBinding } from './gateway-contract.js';
+import type { ActionPolicyProfile, ExactActionBinding } from './gateway-contract.js';
 import { type LocalRecordPort } from './local-store.js';
 type ReadState = Pick<LocalRecordPort, 'read' | 'checksumFor'>;
 export type ReconciliationSubject = Readonly<{
@@ -40,6 +40,12 @@ type SubjectResult = Readonly<{
     subjectDigest: string;
     expectedState: string;
 }>;
+export declare const gatewayAgent: {
+    id: string;
+    revision: number;
+};
+export declare function historicalDefinition(actionRef: ExactActionBinding['actionRef']): ActionDefinition;
+export declare const historicalProfile: ActionPolicyProfile;
 /**
  * Read a v0.1.1 history through existing ports. Eligibility is structural even
  * if the original worker is still live. The token must be rechecked under the
