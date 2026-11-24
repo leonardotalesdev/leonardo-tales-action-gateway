@@ -35,10 +35,7 @@ export function hasReconciliationData(rows, auditText) {
         }
     });
 }
-async function readManifest(state, projectId) {
-    const row = await state.read(actionAllowanceKind, taskManifestId);
-    if (!row)
-        refuse('corrupt-record');
+function projectStoredManifest(state, projectId, row) {
     try {
         return projectManifest(row, projectId, (version) => state.checksumFor(version));
     }
@@ -47,6 +44,12 @@ async function readManifest(state, projectId) {
             throw error;
         refuse('corrupt-record');
     }
+}
+async function readManifest(state, projectId) {
+    const row = await state.read(actionAllowanceKind, taskManifestId);
+    if (!row)
+        refuse('corrupt-record');
+    return projectStoredManifest(state, projectId, row);
 }
 function qualificationEvent(record, runId) {
     const { qualification: q, qualificationDigest: checksum } = record.payload;
@@ -79,17 +82,44 @@ function matchesSubject(q, proof) {
         && q.attemptId === subject.attemptId && q.attemptId === subject.binding.executionId
         && q.executionIdentity === subject.binding.executionIdentity && q.subjectDigest === subjectDigest;
 }
-async function readDecisions(state, history, projectId, rows) {
+async function reconstructObservedSubject(state, audit, projectId, operationKey, runRevision) {
+    // R1 deliberately collapses history failures. The host boundary still needs to
+    // distinguish strict store-read failures from structurally invalid history.
+    let readFailure;
+    function remember(error) {
+        readFailure = error;
+        throw error;
+    }
+    const proof = await reconstructReconciliationSubject({
+        read: (kind, id) => state.read(kind, id).catch(remember),
+        checksumFor(version) {
+            try {
+                return state.checksumFor(version);
+            }
+            catch (error) {
+                return remember(error);
+            }
+        },
+    }, audit, projectId, operationKey, runRevision);
+    if (readFailure !== undefined)
+        throw readFailure;
+    return proof;
+}
+async function readDecisions(state, history, projectId, rows, journal) {
     const decisions = new Map();
     const events = new Map();
-    if (!hasReconciliationData(rows, history))
+    const hasData = journal
+        ? rows.some((row) => isReconciliationRecordId(row.id)) || journal.some(({ event }) => auditReferencesDecision(event))
+        : hasReconciliationData(rows, history);
+    if (!hasData)
         return { decisions, events };
     const manifest = await readManifest(state, projectId);
     if (manifest.storeGeneration === null)
         refuse('corrupt-record');
     const { taskId } = taskStoreIdentity(manifest.configuration.task.id);
     const audit = { read: async () => history };
-    const journal = readExecutionAudit(history, projectId);
+    const verifiedJournal = journal ?? readExecutionAudit(history, projectId);
+    const reconstruct = journal ? reconstructObservedSubject : reconstructReconciliationSubject;
     const requests = new Set();
     const attempts = new Set();
     for (const row of rows) {
@@ -109,7 +139,7 @@ async function readDecisions(state, history, projectId, rows) {
             refuse('corrupt-record');
         // Verify the recorded historical prefix. A prospective finalization separately
         // compares the live token, so a qualification cannot apply to an advanced Run.
-        const proof = await reconstructReconciliationSubject(state, audit, projectId, q.operationKey, runRevisionAtQualification);
+        const proof = await reconstruct(state, audit, projectId, q.operationKey, runRevisionAtQualification);
         if (proof.status !== 'eligible' || proof.result.observedPrefix !== 'reconciliation-required'
             || !matchesSubject(q, proof) || proof.result.expectedState !== q.expectedState
             || proof.historicalFloor > q.qualifiedAt)
@@ -119,12 +149,32 @@ async function readDecisions(state, history, projectId, rows) {
         requests.add(q.requestId);
         attempts.add(q.attemptId);
     }
-    verifyQualificationEvents(journal, events);
+    verifyQualificationEvents(verifiedJournal, events);
     return { decisions, events };
 }
 /** Callers consuming an existing decision must provide a fenced, durable state observation. */
 export async function readReconciliationDecisions(state, audit, projectId, rows) {
     return (await readDecisions(state, await audit.read(), projectId, rows ?? await state.list(actionAllowanceKind))).decisions;
+}
+function findPrior(decisions, requestId, matches) {
+    const prior = [...decisions.values()].find((row) => row.payload.qualification.requestId === requestId);
+    if (prior && !matches(prior.payload.qualification))
+        refuse('request-conflict');
+    return prior;
+}
+function requireUnoccupied(decisions, operationKey, attemptId, decisionId) {
+    if (decisions.has(operationKey) || (attemptId !== undefined && [...decisions.values()].some((row) => row.id === decisionId || row.payload.qualification.attemptId === attemptId)))
+        refuse('attempt-conflict');
+}
+async function verifyAllowance(port, allowance, decisions, rows) {
+    try {
+        await allowance.snapshot(port, undefined, decisions, rows);
+    }
+    catch (error) {
+        if (error instanceof LocalStoreError)
+            throw error;
+        refuse('corrupt-record');
+    }
 }
 export function createReconciliationDecisionKernel({ store, now }) {
     if (!isPairedReconciliationStore(store) || typeof now !== 'function')
@@ -155,7 +205,75 @@ export function createReconciliationDecisionKernel({ store, now }) {
             refuse('invalid-clock');
         return sampled;
     }
-    async function apply(handle) {
+    async function readFencedDecisions(port, verifyJournal = false) {
+        const stateRows = await port.list(actionAllowanceKind);
+        const hasDecisions = stateRows.some((row) => isReconciliationRecordId(row.id));
+        if (hasDecisions)
+            await port.syncDecisionDirectory();
+        const history = await audit.read();
+        const rows = hasDecisions ? await port.list(actionAllowanceKind) : stateRows;
+        const journal = verifyJournal ? readExecutionAudit(history, projectId) : undefined;
+        return { history, rows, ...await readDecisions(port, history, projectId, rows, journal) };
+    }
+    async function validateStore(originalTaskId) {
+        return state.exclusive(async (port) => {
+            const row = await port.read(actionAllowanceKind, taskManifestId);
+            if (!row) {
+                for (const kind of [actionAllowanceKind, 'tasks', 'runs', 'execution', 'proposals',
+                    'approval-requests', 'approval-decisions', 'gateway-attempts']) {
+                    if ((await port.list(kind)).length)
+                        refuse('corrupt-record');
+                }
+                if (await audit.read())
+                    refuse('corrupt-record');
+                refuse('store-not-found');
+            }
+            const manifest = projectStoredManifest(port, projectId, row);
+            if (manifest.configuration.task.id !== originalTaskId)
+                refuse('corrupt-record');
+            if (manifest.storeGeneration === null)
+                refuse('promotion-required');
+            return manifest.storeGeneration;
+        });
+    }
+    async function observe(request) {
+        return state.exclusive(async (port) => {
+            const manifest = await readManifest(port, projectId);
+            if (manifest.storeGeneration === null)
+                refuse('promotion-required');
+            if (manifest.storeGeneration !== request.storeGeneration)
+                refuse('stale-state');
+            const { configuration } = manifest;
+            const { taskId } = taskStoreIdentity(configuration.task.id);
+            const allowance = createTaskAllowance(projectId, taskId, configuration.task.cap, configuration);
+            const { history, rows, decisions } = await readFencedDecisions(port, true);
+            await verifyAllowance(port, allowance, decisions, rows);
+            const prior = findPrior(decisions, request.requestId, (q) => q.actorId === request.actorId && q.operationKey === request.operationKey
+                && q.evidenceRef.id === request.evidenceRef.id && q.evidenceRef.revision === request.evidenceRef.revision);
+            if (prior?.payload.phase === 'applied')
+                return Object.freeze({ status: 'replayed', record: prior });
+            if (!prior)
+                requireUnoccupied(decisions, request.operationKey);
+            const proof = await reconstructObservedSubject(port, { read: async () => history }, projectId, request.operationKey);
+            if (proof.status !== 'eligible') {
+                if (proof.reason === 'invalid-history')
+                    refuse('corrupt-record');
+                refuse(prior && proof.reason === 'unsupported-prefix' ? 'stale-state' : 'ineligible');
+            }
+            if (proof.result.observedPrefix !== 'reconciliation-required')
+                refuse('ineligible');
+            if (prior) {
+                const q = prior.payload.qualification;
+                if (!matchesSubject(q, proof) || q.expectedState !== proof.result.expectedState)
+                    refuse('stale-state');
+            }
+            else {
+                requireUnoccupied(decisions, request.operationKey, proof.result.subject.attemptId);
+            }
+            return Object.freeze({ status: 'eligible', result: proof.result });
+        });
+    }
+    async function applyDecision(handle, diagnoseHistory) {
         const q = handle !== null && typeof handle === 'object' ? qualifications.get(handle) : undefined;
         if (!q)
             refuse('invalid-qualification');
@@ -166,33 +284,15 @@ export function createReconciliationDecisionKernel({ store, now }) {
             const { configuration } = manifest;
             const { taskId } = taskStoreIdentity(configuration.task.id);
             const allowance = createTaskAllowance(projectId, taskId, configuration.task.cap, configuration);
-            async function verifyAllowance(decisions) {
-                try {
-                    await allowance.snapshot(port, undefined, decisions);
-                }
-                catch (error) {
-                    if (error instanceof LocalStoreError)
-                        throw error;
-                    refuse('corrupt-record');
-                }
-            }
             const id = reconciliationDecisionId(q);
-            const stateRows = await port.list(actionAllowanceKind);
-            const hasDecisions = stateRows.some((row) => isReconciliationRecordId(row.id));
-            if (hasDecisions)
-                await port.syncDecisionDirectory();
-            const existingHistory = await audit.read();
-            const stored = await readDecisions(port, existingHistory, projectId, hasDecisions ? await port.list(actionAllowanceKind) : stateRows);
-            const prior = [...stored.decisions.values()].find((row) => row.payload.qualification.requestId === q.requestId);
-            if (prior && !sameQualification(prior.payload.qualification, q))
-                refuse('request-conflict');
+            const stored = await readFencedDecisions(port, diagnoseHistory);
+            const prior = findPrior(stored.decisions, q.requestId, (storedQ) => sameQualification(storedQ, q));
             if (prior?.payload.phase === 'applied') {
-                await verifyAllowance(stored.decisions);
-                return prior;
+                await verifyAllowance(port, allowance, stored.decisions);
+                return Object.freeze({ status: 'replayed', record: prior });
             }
-            if (!prior && [...stored.decisions.values()].some((row) => row.id === id || row.payload.qualification.attemptId === q.attemptId || row.payload.qualification.operationKey === q.operationKey)) {
-                refuse('attempt-conflict');
-            }
+            if (!prior)
+                requireUnoccupied(stored.decisions, q.operationKey, q.attemptId, id);
             if (q.projectId !== projectId || q.taskId !== taskId)
                 refuse('binding-mismatch');
             if (q.storeGeneration !== manifest.storeGeneration)
@@ -201,8 +301,11 @@ export function createReconciliationDecisionKernel({ store, now }) {
                 const current = await readManifest(port, projectId);
                 if (current.storeGeneration !== q.storeGeneration)
                     refuse('stale-state');
-                const proof = await reconstructReconciliationSubject(port, { read: async () => history }, projectId, q.operationKey);
+                const reconstruct = diagnoseHistory ? reconstructObservedSubject : reconstructReconciliationSubject;
+                const proof = await reconstruct(port, { read: async () => history }, projectId, q.operationKey);
                 if (proof.status !== 'eligible' || proof.result.observedPrefix !== 'reconciliation-required') {
+                    if (diagnoseHistory && proof.status === 'ineligible' && proof.reason === 'invalid-history')
+                        refuse('corrupt-record');
                     refuse(prior && proof.status === 'ineligible' && proof.reason === 'unsupported-prefix' ? 'stale-state' : 'ineligible');
                 }
                 if (!matchesSubject(q, proof))
@@ -211,12 +314,13 @@ export function createReconciliationDecisionKernel({ store, now }) {
                     refuse('stale-state');
                 return proof;
             };
-            readExecutionAudit(existingHistory, projectId);
-            const proof = await compareCurrent(existingHistory);
+            if (!diagnoseHistory)
+                readExecutionAudit(stored.history, projectId);
+            const proof = await compareCurrent(stored.history);
             const start = sampleClock();
             if (q.qualifiedAt < proof.historicalFloor || q.qualifiedAt > start)
                 refuse('invalid-clock');
-            await verifyAllowance(stored.decisions);
+            await verifyAllowance(port, allowance, stored.decisions);
             const qualified = prior ?? Object.freeze({
                 kind: actionAllowanceKind, id, projectId, revision: 1, digestVersion: currentDigestVersion,
                 payload: Object.freeze({
@@ -239,7 +343,7 @@ export function createReconciliationDecisionKernel({ store, now }) {
             const current = await port.read(actionAllowanceKind, id);
             if (!current || digest(current) !== digest(qualified))
                 refuse('corrupt-record');
-            await verifyAllowance(stored.decisions);
+            await verifyAllowance(port, allowance, stored.decisions);
             const final = sampleClock();
             if (final < start || final < q.qualifiedAt)
                 refuse('invalid-clock');
@@ -247,8 +351,16 @@ export function createReconciliationDecisionKernel({ store, now }) {
                 payload: Object.freeze({ ...qualified.payload, phase: 'applied', appliedAt: final }),
             });
             await port.applyDecision(applied);
-            return applied;
+            return Object.freeze({ status: 'applied', record: applied });
         });
     }
-    return Object.freeze({ issuer: Object.freeze({ issue }), adjudicator: Object.freeze({ apply }) });
+    async function apply(handle) {
+        return (await applyDecision(handle, false)).record;
+    }
+    function applyWithDisposition(handle) {
+        return applyDecision(handle, true);
+    }
+    return Object.freeze({ validateStore, observe, issuer: Object.freeze({ issue }),
+        adjudicator: Object.freeze({ apply, applyWithDisposition }),
+    });
 }

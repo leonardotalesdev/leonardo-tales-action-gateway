@@ -66,10 +66,12 @@ try {
     "import assert from 'node:assert/strict'",
     "import * as api from '@leonardo-tales/action-gateway'",
     "import { verify } from './out/consumer.js'",
-    "assert.deepEqual(Object.keys(api), ['createActionGateway'])",
+    "assert.deepEqual(Object.keys(api), ['createActionGateway', 'createTrustedReconciliationHost'])",
     ...['internal/execution-gateway', 'internal/store-promotion', 'internal/reconciliation',
-      'internal/reconciliation-decision', 'cli/promote-r2'].map((path) =>
-      `await assert.rejects(import('${name}/dist/${path}.js'), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })`),
+      'internal/reconciliation-decision', 'internal/reconciliation-record', 'internal/local-store',
+      'internal/trusted-reconciliation-host', 'cli/promote-r2'].flatMap((path) =>
+      [path, `dist/${path}.js`].map((specifier) =>
+        `await assert.rejects(import('${name}/${specifier}'), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })`)),
     "const gateway = await api.createActionGateway({ directory: process.cwd() + '/data', task: { id: 'consumer-task', cap: 1, unit: 'rows', expiresAt: '2030-01-02T00:00:00.000Z' }, approverId: 'test-operator', review: async () => 'PENDING', tool: { id: 'customer.export', revision: 1, amount: () => 1, execute: async () => ({ outcome: 'unknown' }) } })",
     "assert.deepEqual(Object.keys(gateway).sort(), ['execute', 'inspect'])",
     "const receipt = await verify(process.cwd() + '/data')",
@@ -92,12 +94,27 @@ try {
   assert.equal(JSON.parse(promoted).record.payload.storeGeneration, generation.trim())
   assert.equal(run(bin, args), generation)
   assert.equal(await readFile(manifestPath, 'utf8'), promoted)
+  run(process.execPath, ['--input-type=module', '-e', [
+    "import assert from 'node:assert/strict'",
+    "import { prepareReconciliation } from './out/consumer.js'",
+    "assert.equal((await prepareReconciliation(process.cwd() + '/data')).decision, 'UNKNOWN')",
+  ].join('\n')])
+  assert.match(run(bin, ['--directory', join(consumer, 'data'), '--task-id', 'recovery-task']), /^[a-f0-9]{64}\n$/)
+  run(process.execPath, ['--input-type=module', '-e', [
+    "import assert from 'node:assert/strict'",
+    "import { verifyReconciliation } from './out/consumer.js'",
+    "const { controllerKeys, receipt, replay } = await verifyReconciliation(process.cwd() + '/data')",
+    "assert.deepEqual(controllerKeys, ['reconcile'])",
+    "assert.equal(receipt.status, 'applied')",
+    "assert.equal(receipt.outcome, 'reconciled-effect')",
+    "assert.deepEqual(replay, { ...receipt, status: 'replayed' })",
+  ].join('\n')])
   await copyFile(join(installed, 'examples/row-export/index.mjs'), join(consumer, 'example.mjs'))
   const output = run(process.execPath, ['example.mjs'])
   assert.match(output, /reason task_limit available_at_decision 3/)
   assert.match(output, /replay export-2 +recorded result +tool effects = 2/)
   console.log(pack.filename, pack.integrity, '(' + pack.files.length + ' files)')
-  console.log('Offline tarball install, zero runtime dependencies, strict TypeScript consumer, public ESM entry, installed maintenance bin and guarded execution passed.')
+  console.log('Offline tarball install, zero runtime dependencies, strict TypeScript consumer, public ESM entry, installed maintenance bin, guarded execution and trusted reconciliation passed.')
   process.stdout.write(output)
 } finally {
   await rm(scratch, { recursive: true, force: true })

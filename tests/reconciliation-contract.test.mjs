@@ -119,7 +119,7 @@ test('the granted reserved prefix and completed UNKNOWN prefix are both recogniz
   assert.deepEqual(await gateway.execute({ ...first, runId: 'replay' }), { ...observed, replayed: true })
   assert.deepEqual(await persistedFiles(directory), before)
   assert.equal(invocations, 1)
-  assert.deepEqual(Object.keys(gatewayApi), ['createActionGateway'])
+  assert.deepEqual(Object.keys(gatewayApi), ['createActionGateway', 'createTrustedReconciliationHost'])
   assert.deepEqual(Object.keys(gateway).sort(), ['execute', 'inspect'])
 })
 
