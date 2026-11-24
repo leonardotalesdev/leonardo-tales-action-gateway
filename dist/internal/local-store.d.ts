@@ -14,9 +14,14 @@ export type LocalRecordPort = Readonly<{
     create(record: RecordWrite): Promise<void>;
     save(record: RecordWrite, expectedRevision: number): Promise<void>;
 }>;
+type HistoryReadPort = Pick<LocalRecordPort, 'read' | 'list' | 'checksumFor'>;
+export type LocalLockedRecordPort = LocalRecordPort & Readonly<{
+    strictHistory: HistoryReadPort;
+    syncDecisionDirectory(): Promise<void>;
+}>;
 /** Trusted host critical section. Its scoped port expires when the callback settles. */
 export type LocalTransactionalRecordPort = LocalRecordPort & Readonly<{
-    exclusive<T>(work: (port: LocalRecordPort) => Promise<T>): Promise<T>;
+    exclusive<T>(work: (port: LocalLockedRecordPort) => Promise<T>): Promise<T>;
 }>;
 export type LocalAuditPort = Readonly<{
     read(): Promise<string>;
@@ -26,6 +31,26 @@ export type LocalAuditPort = Readonly<{
 export type LocalStoreOptions = Readonly<{
     checkpoint?: (stage: 'temporary-synced' | 'renamed' | 'directory-synced') => void | Promise<void>;
 }>;
+type ReconciliationWritePort = HistoryReadPort & Readonly<{
+    createDecision(record: LocalRecord): Promise<void>;
+    applyDecision(record: LocalRecord): Promise<void>;
+    syncDecisionDirectory(): Promise<void>;
+}>;
+export type PairedReconciliationStore = Readonly<{
+    projectId: string;
+    state: Readonly<{
+        exclusive<T>(work: (port: ReconciliationWritePort) => Promise<T>): Promise<T>;
+    }>;
+    audit: LocalAuditPort;
+}>;
+type ReconciliationStoreOptions = Readonly<{
+    legacyDigestLocale?: string;
+    stateCheckpoint?: LocalStoreOptions['checkpoint'];
+    auditCheckpoint?: LocalStoreOptions['checkpoint'];
+}>;
+export declare function isPairedReconciliationStore(value: unknown): value is PairedReconciliationStore;
+/** Share the explicit R2 locale policy with private R3 storage composition. */
+export declare function createExplicitStoreChecksum(locale?: string, deferLocaleValidation?: boolean): LocalRecordPort['checksumFor'];
 export declare const actionAllowanceKind = "action-allowance";
 export declare const taskManifestId = "task-allowance";
 export declare function localId(value: unknown): value is string;
@@ -66,6 +91,8 @@ export declare function openLocalRecordStore(directory: string, projectId: strin
 }): Promise<LocalTransactionalRecordPort>;
 /** Append-only API; full-file atomic replacement keeps partial JSONL tails out of history. */
 export declare function openLocalAuditPort(directory: string, projectId: string, options?: LocalStoreOptions): Promise<LocalAuditPort>;
+/** Pair existing state and audit beneath one verified Task directory. */
+export declare function openReconciliationStore(directory: string, projectId: string, options?: ReconciliationStoreOptions): Promise<PairedReconciliationStore>;
 /** Existing Task paths only. The writer can replace just the canonical manifest. */
 export declare function openExistingPromotionStore(directory: string, projectId: string, checksumFor: LocalRecordPort['checksumFor'], options: LocalStoreOptions): Promise<{
     snapshot: () => Promise<{

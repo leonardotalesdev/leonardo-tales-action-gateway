@@ -8,8 +8,9 @@ import { createTrustedExecutionGateway, parseStoredProposal } from './execution-
 import { approvalDecisionId, parseApprovalDecision, parseApprovalRequest } from './gateway-approval.js';
 import { ExecutionGatewayError } from './gateway-contract.js';
 import { computeSnapshotChecksum as digest, currentDigestVersion } from './digest.js';
-import { copyLocalJson, localId, localObject, localTimestamp, openLocalAuditPort, openLocalRecordStore, canonicalGatewayPath } from './local-store.js';
+import { actionAllowanceKind, copyLocalJson, localId, localObject, localTimestamp, openLocalAuditPort, openLocalRecordStore, canonicalGatewayPath } from './local-store.js';
 import { taskStoreIdentity } from './store-manifest.js';
+import { hasReconciliationData, readReconciliationDecisions } from './reconciliation-decision.js';
 function runAction(result) {
     if (!result.ok)
         throw new Error(result.error);
@@ -82,38 +83,60 @@ export async function createActionGateway(options) {
             input: { payload: input, amount: operation.amount, unit: task.unit, operationKey: operation.key },
             target: { kind: 'logical-operation', resource: operation.key } }, { task: owner, run, agent, definitions: [definition], createdAt: operation.createdAt }));
     }
-    async function storedApproval(value) {
-        const registered = await state.read('proposals', operationId(value.key));
+    async function storedApproval(value, port = state) {
+        const registered = await port.read('proposals', operationId(value.key));
         if (!registered)
             return null;
-        const hash = state.checksumFor(value.digestVersion);
+        const hash = port.checksumFor(value.digestVersion);
         const stored = parseStoredProposal(registered, value.digestVersion, hash);
         if (stored.binding.proposalDigest !== value.proposalDigest || hash(stored.proposal) !== value.proposalDigest
             || (value.binding && digest(stored.binding) !== digest(value.binding))) {
             throw new Error('approval-binding-conflict');
         }
-        const row = await state.read('approval-requests', stored.requestId);
+        const row = await port.read('approval-requests', stored.requestId);
         if (!row)
             return null;
         if (row.digestVersion !== value.digestVersion)
             throw new Error('approval-binding-conflict');
         const request = parseApprovalRequest(row.payload, stored.binding, stored.proposal, hash);
-        const recorded = await state.read('approval-decisions', approvalDecisionId(request.id));
+        const recorded = await port.read('approval-decisions', approvalDecisionId(request.id));
         if (recorded && recorded.digestVersion !== value.digestVersion)
             throw new Error('approval-binding-conflict');
         return { request, decision: recorded ? parseApprovalDecision(recorded.payload, request, hash) : null };
     }
-    async function receipt(key, override, replayed = false) {
-        const { totals, selected } = await allowance.snapshot(state, key);
+    async function allowanceObservation(port) {
+        const rows = await port.list(actionAllowanceKind);
+        const auditText = await audit.read();
+        return { rows, hasReconciliation: hasReconciliationData(rows, auditText) };
+    }
+    async function lockedReconciliationView(writer) {
+        if (!(await allowanceObservation(writer)).hasReconciliation)
+            return undefined;
+        await writer.syncDecisionDirectory();
+        const port = writer.strictHistory;
+        const rows = await port.list(actionAllowanceKind);
+        const decisions = await readReconciliationDecisions(port, audit, projectId, rows);
+        return { port, rows, decisions };
+    }
+    async function projectReceipt(port, rows, decisions, key, override, replayed = false) {
+        const { totals, selected } = await allowance.snapshot(port, key, decisions, rows);
         if (!selected)
-            throw new Error('missing-task-operation');
+            return null;
         const { value, result } = selected;
-        const approval = await storedApproval(value);
+        const approval = await storedApproval(value, port);
         let decision = 'APPROVAL_REQUIRED';
         let reason = 'exact-approval-required';
         if (value.phase === 'blocked') {
             decision = 'BLOCKED';
             reason = value.refusalBasis?.reason ?? 'task_limit';
+        }
+        else if (result?.status === 'reconciled-effect') {
+            decision = 'EXECUTED';
+            reason = result.status;
+        }
+        else if (result?.status === 'reconciled-no-effect') {
+            decision = 'BLOCKED';
+            reason = result.status;
         }
         else if (result?.status === 'confirmed-success') {
             decision = 'EXECUTED';
@@ -142,13 +165,35 @@ export async function createActionGateway(options) {
             replayed, approvalRequestId: approval?.request.id ?? null,
             evidenceId: result && result.status !== 'unknown' ? result.evidenceRef.id : null });
     }
+    async function readReceipt(key, override, replayed = false) {
+        const before = await allowanceObservation(state);
+        if (!before.hasReconciliation) {
+            const result = await projectReceipt(state, before.rows, undefined, key, override, replayed);
+            if (!(await allowanceObservation(state)).hasReconciliation)
+                return result;
+        }
+        // A visible revision-2 rename may be uncertain until directory sync succeeds.
+        return state.exclusive(async (writer) => {
+            const view = await lockedReconciliationView(writer);
+            if (!view)
+                throw new Error('invalid-reconciliation-history');
+            await allowance.verifyManifest(view.port);
+            return projectReceipt(view.port, view.rows, view.decisions, key, override, replayed);
+        });
+    }
+    async function receipt(key, override, replayed = false) {
+        const result = await readReceipt(key, override, replayed);
+        if (!result)
+            throw new Error('missing-task-operation');
+        return result;
+    }
     return Object.freeze({
         async inspect(operationKey) {
             if (!localId(operationKey))
                 throw new Error('invalid-operation-key');
             const value = await allowance.read(state, operationKey);
             await allowance.verifyManifest(state, value ? 'existing' : 'inspect');
-            return value ? receipt(operationKey) : null;
+            return readReceipt(operationKey);
         },
         async execute(intent) {
             const { runId, operationKey, input: supplied } = localObject(intent, ['runId', 'operationKey', 'input']);
@@ -159,6 +204,7 @@ export async function createActionGateway(options) {
                 throw new Error('invalid-action-intent');
             // Task metadata and the logical identity are written with the same project writer as admission.
             const prepared = await state.exclusive(async (port) => {
+                await lockedReconciliationView(port);
                 await allowance.verifyManifest(port, 'initialize');
                 const existing = await allowance.read(port, operationKey);
                 const digestVersion = existing?.digestVersion ?? currentDigestVersion;
@@ -215,7 +261,7 @@ export async function createActionGateway(options) {
                     },
                     verifyStoredDecision: (decision, request) => matches(request) && decision.approverId === approverId && decision.decision === endorsed?.decision,
                 },
-                admit: (port, binding) => allowance.reserve(port, value.key, binding, digestVersion),
+                admit: async (port, binding) => allowance.reserve(port, value.key, binding, digestVersion, await lockedReconciliationView(port)),
                 actions: [{ definition, profile, adapter: {
                             id: 'action-gateway-local-handler', revision,
                             invoke: async (context) => {

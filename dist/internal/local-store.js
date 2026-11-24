@@ -2,14 +2,42 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { computeRecordEnvelopeChecksum, computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion } from './digest.js';
+import { computeRecordEnvelopeChecksum, computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion, validateExplicitLegacyLocale } from './digest.js';
 import { copyLocalJson, LocalStoreError, maxBytes, rejectLocalProxy } from './local-record.js';
+import { isReconciliationRecordId, parseReconciliationDecision, sameQualification } from './reconciliation-record.js';
 export { copyLocalJson, LocalStoreError } from './local-record.js';
+const pairedStores = new WeakSet();
+export function isPairedReconciliationStore(value) {
+    return !!value && typeof value === 'object' && pairedStores.has(value);
+}
+/** Share the explicit R2 locale policy with private R3 storage composition. */
+export function createExplicitStoreChecksum(locale, deferLocaleValidation = false) {
+    if (locale !== undefined && !deferLocaleValidation)
+        validateExplicitLegacyLocale(locale);
+    let legacy;
+    return (version) => {
+        if (version === currentDigestVersion)
+            return computeSnapshotChecksum;
+        if (version !== legacyDigestVersion)
+            throw new LocalStoreError('invalid-record');
+        if (locale === undefined)
+            throw new LocalStoreError('legacy-digest-locale-required');
+        if (!legacy) {
+            if (deferLocaleValidation)
+                validateExplicitLegacyLocale(locale);
+            legacy = createLegacySnapshotChecksum(locale);
+        }
+        return legacy;
+    };
+}
 export const actionAllowanceKind = 'action-allowance';
 export const taskManifestId = 'task-allowance';
 const kinds = ['tasks', 'runs', 'execution', 'proposals', 'approval-requests', 'approval-decisions', 'gateway-attempts', actionAllowanceKind];
 const immutableKinds = ['proposals', 'approval-requests', 'approval-decisions'];
 const recordKeys = ['kind', 'id', 'projectId', 'revision', 'payload'];
+function decisionRecord(record) {
+    return record.kind === actionAllowanceKind && isReconciliationRecordId(record.id);
+}
 export function localId(value) {
     return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(value);
 }
@@ -229,7 +257,10 @@ export function verifyRecordEnvelope(value, projectId, kind, checksumFor, id) {
     if (raw.checksum !== checksum || record.projectId !== projectId || record.kind !== kind
         || (id !== undefined && record.id !== id))
         throw new LocalStoreError('corrupt-record');
-    return { envelope: value, record: Object.freeze({ ...record, digestVersion }) };
+    const decoded = Object.freeze({ ...record, digestVersion });
+    if (decisionRecord(record))
+        parseReconciliationDecision(decoded);
+    return { envelope: value, record: decoded };
 }
 function decodeRecord(text, projectId, kind, checksumFor, id) {
     try {
@@ -248,16 +279,21 @@ export function encodeRecordEnvelope(record, digestVersion = currentDigestVersio
 /** Explicit trusted-host storage adapter. No default path, agent tool or auto-recovery. */
 export async function openLocalRecordStore(directory, projectId, options = {}) {
     const legacyChecksum = createLegacySnapshotChecksum(options.legacyDigestLocale);
-    function checksumFor(version) {
+    const checksumFor = (version) => {
         if (version === legacyDigestVersion)
             return legacyChecksum;
         if (version === currentDigestVersion)
             return computeSnapshotChecksum;
         throw new LocalStoreError('invalid-record');
-    }
-    const { base, writer } = await area(directory, projectId, options);
-    for (const kind of kinds)
-        await safeDirectory(join(base, kind), true);
+    };
+    const strictChecksumFor = createExplicitStoreChecksum(options.legacyDigestLocale, true);
+    return openRecordStore(directory, projectId, options, checksumFor, strictChecksumFor, true);
+}
+async function openRecordStore(directory, projectId, options, checksumFor, strictChecksumFor, create) {
+    const { base, writer } = await area(directory, projectId, options, create);
+    if (create)
+        for (const kind of kinds)
+            await safeDirectory(join(base, kind), true);
     function pathFor(kind, id) {
         if (!kinds.includes(kind))
             throw new LocalStoreError('invalid-record');
@@ -265,13 +301,19 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
             throw new LocalStoreError('invalid-id');
         return join(base, kind, `${computeSnapshotChecksum(id)}.json`);
     }
-    async function read(kind, id) {
+    function readRecord(text, kind, id, strict) {
+        const { record } = decodeRecord(text, projectId, kind, strict ? strictChecksumFor : checksumFor, id);
+        if (strict && record.digestVersion === legacyDigestVersion)
+            strictChecksumFor(legacyDigestVersion);
+        return record;
+    }
+    async function read(kind, id, strict = false) {
         const path = pathFor(kind, id);
         await safeDirectory(dirname(path), false);
         const text = await readText(path);
         if (text === null)
             return null;
-        return decodeRecord(text, projectId, kind, checksumFor, id).record;
+        return readRecord(text, kind, id, strict);
     }
     async function write(value, expected, replace) {
         // Checking for the optional version probes the write envelope before localObject.
@@ -299,9 +341,21 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
         if ((version !== legacyDigestVersion && version !== currentDigestVersion)
             || (previous && version !== previous.digestVersion))
             throw new LocalStoreError('invalid-record');
+        if (decisionRecord(record)) {
+            const nextDecision = parseReconciliationDecision({ ...record, digestVersion: version });
+            if (previous) {
+                const priorDecision = parseReconciliationDecision(previous);
+                if (previous.revision !== 1 || record.revision !== 2
+                    || priorDecision.qualificationDigest !== nextDecision.qualificationDigest
+                    || priorDecision.runRevisionAtQualification !== nextDecision.runRevisionAtQualification
+                    || !sameQualification(priorDecision.qualification, nextDecision.qualification)) {
+                    throw new LocalStoreError('invalid-record');
+                }
+            }
+        }
         await replace(pathFor(record.kind, record.id), `${JSON.stringify(encodeRecordEnvelope(record, version))}\n`);
     }
-    async function list(kind) {
+    async function list(kind, strict = false) {
         pathFor(kind, 'validate-id');
         await safeDirectory(join(base, kind), false);
         const results = [];
@@ -310,12 +364,14 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
                 continue;
             const text = await readText(join(base, kind, name));
             try {
-                const { record } = decodeRecord(text, projectId, kind, checksumFor);
+                const record = readRecord(text, kind, undefined, strict);
                 if (`${computeSnapshotChecksum(record.id)}.json` !== name)
                     throw new Error();
                 results.push(record);
             }
-            catch {
+            catch (error) {
+                if (strict && error instanceof LocalStoreError && error.code === 'legacy-digest-locale-required')
+                    throw error;
                 throw new LocalStoreError('corrupt-record');
             }
         }
@@ -328,10 +384,23 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
             let active = true;
             function check() { if (!active)
                 throw new LocalStoreError('locked'); }
+            function history(strict) {
+                return Object.freeze({
+                    checksumFor: (version) => { check(); return (strict ? strictChecksumFor : checksumFor)(version); },
+                    read: async (kind, id) => { check(); const result = await read(kind, id, strict); check(); return result; },
+                    list: async (kind) => { check(); const result = await list(kind, strict); check(); return result; },
+                });
+            }
             const scoped = Object.freeze({
-                checksumFor: (version) => { check(); return checksumFor(version); },
-                read: async (kind, id) => { check(); const result = await read(kind, id); check(); return result; },
-                list: async (kind) => { check(); const result = await list(kind); check(); return result; },
+                ...history(false),
+                strictHistory: history(true),
+                async syncDecisionDirectory() {
+                    check();
+                    const directory = join(base, actionAllowanceKind);
+                    await safeDirectory(directory, false);
+                    await syncDirectory(directory);
+                    check();
+                },
                 create: async (record) => { check(); await write(record, null, replace); },
                 save: async (record, expected) => { check(); await write(record, expected, replace); },
             });
@@ -346,7 +415,10 @@ export async function openLocalRecordStore(directory, projectId, options = {}) {
 }
 /** Append-only API; full-file atomic replacement keeps partial JSONL tails out of history. */
 export async function openLocalAuditPort(directory, projectId, options = {}) {
-    const { base, writer } = await area(directory, projectId, options);
+    return openAuditPort(directory, projectId, options, true);
+}
+async function openAuditPort(directory, projectId, options, create) {
+    const { base, writer } = await area(directory, projectId, options, create);
     const path = join(base, 'events.jsonl');
     async function read() { await safeDirectory(base, false); return (await readText(path)) ?? ''; }
     return Object.freeze({ read, async appendLine(build) {
@@ -361,6 +433,37 @@ export async function openLocalAuditPort(directory, projectId, options = {}) {
                 return line;
             });
         } });
+}
+/** Pair existing state and audit beneath one verified Task directory. */
+export async function openReconciliationStore(directory, projectId, options = {}) {
+    if (!canonicalGatewayPath(directory))
+        throw new LocalStoreError('unsafe-path');
+    await verifyGatewayDirectory(directory);
+    const checksumFor = createExplicitStoreChecksum(options.legacyDigestLocale, true);
+    const state = await openRecordStore(join(directory, 'state'), projectId, { checkpoint: options.stateCheckpoint }, checksumFor, checksumFor, false);
+    const audit = await openAuditPort(join(directory, 'audit'), projectId, { checkpoint: options.auditCheckpoint }, false);
+    const store = Object.freeze({
+        projectId,
+        state: Object.freeze({
+            exclusive: (work) => state.exclusive((port) => work(Object.freeze({
+                ...port.strictHistory,
+                syncDecisionDirectory: port.syncDecisionDirectory,
+                async createDecision(record) {
+                    if (!decisionRecord(record) || record.revision !== 1)
+                        throw new LocalStoreError('invalid-record');
+                    await port.create(record);
+                },
+                async applyDecision(record) {
+                    if (!decisionRecord(record) || record.revision !== 2)
+                        throw new LocalStoreError('invalid-record');
+                    await port.save(record, 1);
+                },
+            }))),
+        }),
+        audit,
+    });
+    pairedStores.add(store);
+    return store;
 }
 /** Existing Task paths only. The writer can replace just the canonical manifest. */
 export async function openExistingPromotionStore(directory, projectId, checksumFor, options) {

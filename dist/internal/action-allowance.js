@@ -1,6 +1,7 @@
 import { computeSnapshotChecksum as digest } from './digest.js';
 import { projectManifest } from './store-manifest.js';
 import { readClosedExecution } from './execution-gateway.js';
+import { isReconciliationRecordId } from './reconciliation-record.js';
 import { actionAllowanceKind as kind, localId, localObject, localRevision, localTimestamp, taskManifestId as manifestId } from './local-store.js';
 export function operationId(key) { return `operation-${digest(key)}`; }
 export function nativeRunId(id) { return `run-${digest(id)}`; }
@@ -13,8 +14,11 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
         if (!record) {
             if (mode === 'existing' || (await port.list(kind)).length)
                 throw new Error('missing-task-allowance');
-            if (mode === 'initialize')
+            if (mode === 'initialize') {
+                if (!port.create)
+                    throw new Error('missing-task-allowance');
                 await port.create({ kind, projectId, id: manifestId, revision: 1, payload: manifest });
+            }
             return;
         }
         const { configuration } = projectManifest(record, projectId, port.checksumFor);
@@ -60,36 +64,61 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
     function register(port, { digestVersion, ...value }) {
         return port.create({ kind, projectId, id: operationId(value.key), revision: 1, payload: value, digestVersion });
     }
-    async function outcome(port, value) {
-        return value.phase === 'held' ? await readClosedExecution(port, value.binding, value.digestVersion) : null;
+    async function outcome(port, value, decision) {
+        if (value.phase !== 'held') {
+            if (decision)
+                throw new Error('invalid-reconciliation-history');
+            return null;
+        }
+        const native = await readClosedExecution(port, value.binding, value.digestVersion);
+        if (!decision)
+            return native;
+        if (native)
+            throw new Error('invalid-reconciliation-history');
+        if (decision.payload.phase === 'qualified')
+            return null;
+        const { outcome: resolved, evidenceRef } = decision.payload.qualification;
+        return {
+            status: resolved === 'confirmed-effect' ? 'reconciled-effect' : 'reconciled-no-effect',
+            evidenceRef,
+        };
     }
-    async function snapshot(port, key) {
+    async function snapshot(port, key, decisions, rows) {
         let remaining = cap;
         let settled = 0;
         let held = 0;
         let selected;
-        for (const row of await port.list(kind)) {
+        const validatedDecisions = new Set(Array.from(decisions?.values() ?? [], (decision) => decision.id));
+        for (const row of rows ?? await port.list(kind)) {
             if (row.id === manifestId)
                 continue;
+            if (isReconciliationRecordId(row.id)) {
+                if (!validatedDecisions.delete(row.id))
+                    throw new Error('invalid-reconciliation-history');
+                continue;
+            }
             const value = parse(row);
-            const result = await outcome(port, value);
+            const result = await outcome(port, value, decisions?.get(value.key));
             if (value.key === key)
                 selected = { value, result };
             if (value.phase !== 'held')
                 continue;
-            if (result?.status === 'confirmed-failure' && result.effect === 'not-performed')
+            if (result?.status === 'reconciled-no-effect'
+                || (result?.status === 'confirmed-failure' && result.effect === 'not-performed'))
                 continue;
             if (value.amount > remaining)
                 throw new Error('task-allowance-inconsistent');
             remaining -= value.amount;
-            if (result?.status === 'confirmed-success')
+            if (result?.status === 'confirmed-success' || result?.status === 'reconciled-effect')
                 settled += value.amount;
             else
                 held += value.amount;
         }
+        if (validatedDecisions.size)
+            throw new Error('invalid-reconciliation-history');
         return { totals: { cap, settled, held, remaining }, selected };
     }
-    async function reserve(port, key, binding, version) {
+    async function reserve(port, key, binding, version, view) {
         await verifyManifest(port);
         const value = await read(port, key);
         if (!value || value.digestVersion !== version || value.proposalDigest !== binding.proposalDigest
@@ -100,7 +129,7 @@ export function createTaskAllowance(projectId, taskId, cap, manifest) {
         // A prior hold can exist even if the gateway crashed before creating its attempt record.
         if (value.phase !== 'pending')
             return false;
-        const { totals } = await snapshot(port);
+        const { totals } = await snapshot(view?.port ?? port, undefined, view?.decisions, view?.rows);
         const admitted = value.amount <= totals.remaining;
         const decision = admitted ? { phase: 'held' } : { phase: 'blocked', refusalBasis: { reason: 'task_limit', ...totals } };
         const { digestVersion, ...payload } = value;

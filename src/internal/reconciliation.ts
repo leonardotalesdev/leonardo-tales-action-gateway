@@ -34,12 +34,15 @@ export type ReconciliationSubject = Readonly<{
 }>
 
 type Refusal = 'missing-operation' | 'not-held' | 'missing-attempt' | 'closed-attempt' | 'unsupported-prefix' | 'invalid-history'
-type SubjectResult =
-  | Readonly<{ status: 'ineligible'; reason: Refusal }>
-  | Readonly<{
-    status: 'eligible'; observedPrefix: 'reserved' | 'reconciliation-required'
-    subject: ReconciliationSubject; subjectDigest: string; expectedState: string
-  }>
+type IneligibleSubject = Readonly<{ status: 'ineligible'; reason: Refusal }>
+type EligibleSubject = Readonly<{
+  status: 'eligible'; observedPrefix: 'reserved' | 'reconciliation-required'
+  subject: ReconciliationSubject; subjectDigest: string; expectedState: string
+}>
+type SubjectResult = IneligibleSubject | EligibleSubject
+type VerifiedSubject = IneligibleSubject | Readonly<{
+  status: 'eligible'; result: EligibleSubject; historicalFloor: string; runRevision: number
+}>
 
 const gatewayActor = 'action-gateway-host'
 export const gatewayAgent = { id: gatewayActor, revision: 1 }
@@ -65,7 +68,7 @@ function requireHistory(condition: unknown): asserts condition {
   if (!condition) throw new Error('invalid-reconciliation-history')
 }
 
-function refuse(reason: Refusal): SubjectResult {
+function refuse(reason: Refusal): IneligibleSubject {
   return Object.freeze({ status: 'ineligible', reason })
 }
 
@@ -99,7 +102,7 @@ function authorizationAnchors(
       && (event.occurredAt < lastUpdatedAt || event.occurredAt < relevant[index - 1].event.occurredAt)) return null
   }
   // Chain verification comes first. Only the selected event contents enter the token.
-  return relevant.map(({ eventHash }) => eventHash)
+  return relevant
 }
 
 /**
@@ -110,6 +113,15 @@ function authorizationAnchors(
 export async function readReconciliationSubject(
   state: ReadState, audit: Pick<ExecutionAuditPort, 'read'>, projectId: string, operationKey: string,
 ): Promise<SubjectResult> {
+  const verified = await reconstructReconciliationSubject(state, audit, projectId, operationKey)
+  return verified.status === 'eligible' ? verified.result : verified
+}
+
+/** With a stored witness, verify the original prefix of an intact, replay-validated Run. */
+export async function reconstructReconciliationSubject(
+  state: ReadState, audit: Pick<ExecutionAuditPort, 'read'>, projectId: string, operationKey: string,
+  runRevisionAtQualification?: number,
+): Promise<VerifiedSubject> {
   try {
     requireHistory(localId(operationKey) && localId(projectId))
     const read = async (kind: string, id: string) => {
@@ -201,9 +213,12 @@ export async function readReconciliationSubject(
       && execution.revision === executionRow.revision && execution.createdAt >= run.createdAt && proposal.createdAt >= run.createdAt
       && execution.createdAt <= attempt.value.createdAt)
 
-    const tail = run.appliedEvents.slice(operation.runRevision - 1)
+    const runRevision = runRevisionAtQualification ?? run.revision
+    requireHistory(runRevision <= run.revision && (runRevisionAtQualification === undefined || interrupted))
+    const tail = run.appliedEvents.slice(operation.runRevision - 1, runRevision - 1)
     const [awaited, resolved, blocked] = tail
-    if (tail.length !== (interrupted ? 3 : 2) || run.status !== (interrupted ? 'blocked' : 'running')
+    if (tail.length !== (interrupted ? 3 : 2)
+      || (runRevision === run.revision && run.status !== (interrupted ? 'blocked' : 'running'))
       || awaited?.type !== 'await-approval' || resolved?.type !== 'resolve-approval' || resolved.outcome !== 'approved'
       || !same(awaited.actionRef, binding.proposalRef) || !same(resolved.actionRef, binding.proposalRef)
       || !same(resolved.approvalRef, { id: decision.id, revision: decisionRow.revision })
@@ -223,9 +238,10 @@ export async function readReconciliationSubject(
       { type: 'execution-authority-granted', code: 'ephemeral-permit-created' },
     ]
     if (interrupted) observations.push({ type: 'execution-result-recorded', code: 'execution-unknown' })
-    const auditAnchors = authorizationAnchors(await audit.read(), binding, observations,
-      attempt.value.createdAt, request.expiresAt, run.updatedAt)
-    if (!auditAnchors) return refuse('unsupported-prefix')
+    const runObservedAt = runRevision === run.revision ? run.updatedAt : tail.at(-1)!.occurredAt
+    const anchors = authorizationAnchors(await audit.read(), binding, observations,
+      attempt.value.createdAt, request.expiresAt, runObservedAt)
+    if (!anchors) return refuse('unsupported-prefix')
 
     const subject = copyLocalJson({
       projectId, taskId, originalTaskId: taskSpec.id, originalRunId: operation.runId, operationKey, digestVersion,
@@ -239,15 +255,18 @@ export async function readReconciliationSubject(
     const historicalState = digest({
       domain: 'action-gateway/reconciliation-state/v1', subjectDigest,
       operation: digest(operationRow.payload), attempt: digest(attempt.record), execution: digest(execution),
-      run: { revision: run.revision, events: tail },
-      approval: digest(decision), auditAnchors,
+      run: { revision: runRevision, events: tail },
+      approval: digest(decision), auditAnchors: anchors.map(({ eventHash }) => eventHash),
     })
     const latest = await read(actionAllowanceKind, taskManifestId)
     requireHistory(latest && same(latest, manifestRow))
     const expectedState = storeGeneration === null ? historicalState : digest({
       domain: 'action-gateway/reconciliation-state/v2', manifestRevision: 2, storeGeneration, historicalState,
     })
-    return Object.freeze({ status: 'eligible', observedPrefix: attempt.value.phase, subject, subjectDigest, expectedState })
+    const historicalFloor = [decision.decidedAt, attempt.value.createdAt, execution.updatedAt, runObservedAt,
+      ...anchors.map(({ event }) => event.occurredAt)].sort().at(-1)!
+    const result = Object.freeze({ status: 'eligible', observedPrefix: attempt.value.phase, subject, subjectDigest, expectedState } as const)
+    return Object.freeze({ status: 'eligible', result, historicalFloor, runRevision })
   } catch {
     return refuse('invalid-history')
   }

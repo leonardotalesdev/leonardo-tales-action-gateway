@@ -1,4 +1,4 @@
-export type ExecutionAuditEventType = 'action-proposed' | 'policy-evaluated' | 'approval-requested' | 'approval-recorded' | 'execution-authority-granted' | 'execution-started' | 'execution-result-recorded' | 'reconciliation-started' | 'reconciliation-completed';
+export type ExecutionAuditEventType = 'action-proposed' | 'policy-evaluated' | 'approval-requested' | 'approval-recorded' | 'execution-authority-granted' | 'execution-started' | 'execution-result-recorded' | 'reconciliation-started' | 'reconciliation-completed' | 'reconciliation-decision-qualified';
 export type ExecutionAuditEvent = Readonly<{
     schemaVersion: 'execution-audit-event/v0.1';
     id: string;
@@ -44,5 +44,5 @@ export declare function createExecutionAuditStore(port: ExecutionAuditPort, proj
         eventHash: string;
         chainHash: string;
     }>[]>;
-    append(value: ExecutionAuditEvent): Promise<ExecutionAuditEnvelope>;
+    append(value: ExecutionAuditEvent, verifyHistory?: (records: readonly ExecutionAuditEnvelope[]) => void): Promise<ExecutionAuditEnvelope>;
 }>;

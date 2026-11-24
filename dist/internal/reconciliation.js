@@ -56,7 +56,7 @@ function authorizationAnchors(history, binding, observations, attemptCreatedAt, 
             return null;
     }
     // Chain verification comes first. Only the selected event contents enter the token.
-    return relevant.map(({ eventHash }) => eventHash);
+    return relevant;
 }
 /**
  * Read a v0.1.1 history through existing ports. Eligibility is structural even
@@ -64,6 +64,11 @@ function authorizationAnchors(history, binding, observations, attemptCreatedAt, 
  * writer by any future decision path.
  */
 export async function readReconciliationSubject(state, audit, projectId, operationKey) {
+    const verified = await reconstructReconciliationSubject(state, audit, projectId, operationKey);
+    return verified.status === 'eligible' ? verified.result : verified;
+}
+/** With a stored witness, verify the original prefix of an intact, replay-validated Run. */
+export async function reconstructReconciliationSubject(state, audit, projectId, operationKey, runRevisionAtQualification) {
     try {
         requireHistory(localId(operationKey) && localId(projectId));
         const read = async (kind, id) => {
@@ -153,9 +158,12 @@ export async function readReconciliationSubject(state, audit, projectId, operati
             && same(execution.proposalRef, binding.proposalRef) && execution.proposalDigest === operation.proposalDigest
             && execution.revision === executionRow.revision && execution.createdAt >= run.createdAt && proposal.createdAt >= run.createdAt
             && execution.createdAt <= attempt.value.createdAt);
-        const tail = run.appliedEvents.slice(operation.runRevision - 1);
+        const runRevision = runRevisionAtQualification ?? run.revision;
+        requireHistory(runRevision <= run.revision && (runRevisionAtQualification === undefined || interrupted));
+        const tail = run.appliedEvents.slice(operation.runRevision - 1, runRevision - 1);
         const [awaited, resolved, blocked] = tail;
-        if (tail.length !== (interrupted ? 3 : 2) || run.status !== (interrupted ? 'blocked' : 'running')
+        if (tail.length !== (interrupted ? 3 : 2)
+            || (runRevision === run.revision && run.status !== (interrupted ? 'blocked' : 'running'))
             || awaited?.type !== 'await-approval' || resolved?.type !== 'resolve-approval' || resolved.outcome !== 'approved'
             || !same(awaited.actionRef, binding.proposalRef) || !same(resolved.actionRef, binding.proposalRef)
             || !same(resolved.approvalRef, { id: decision.id, revision: decisionRow.revision })
@@ -177,8 +185,9 @@ export async function readReconciliationSubject(state, audit, projectId, operati
         ];
         if (interrupted)
             observations.push({ type: 'execution-result-recorded', code: 'execution-unknown' });
-        const auditAnchors = authorizationAnchors(await audit.read(), binding, observations, attempt.value.createdAt, request.expiresAt, run.updatedAt);
-        if (!auditAnchors)
+        const runObservedAt = runRevision === run.revision ? run.updatedAt : tail.at(-1).occurredAt;
+        const anchors = authorizationAnchors(await audit.read(), binding, observations, attempt.value.createdAt, request.expiresAt, runObservedAt);
+        if (!anchors)
             return refuse('unsupported-prefix');
         const subject = copyLocalJson({
             projectId, taskId, originalTaskId: taskSpec.id, originalRunId: operation.runId, operationKey, digestVersion,
@@ -192,15 +201,18 @@ export async function readReconciliationSubject(state, audit, projectId, operati
         const historicalState = digest({
             domain: 'action-gateway/reconciliation-state/v1', subjectDigest,
             operation: digest(operationRow.payload), attempt: digest(attempt.record), execution: digest(execution),
-            run: { revision: run.revision, events: tail },
-            approval: digest(decision), auditAnchors,
+            run: { revision: runRevision, events: tail },
+            approval: digest(decision), auditAnchors: anchors.map(({ eventHash }) => eventHash),
         });
         const latest = await read(actionAllowanceKind, taskManifestId);
         requireHistory(latest && same(latest, manifestRow));
         const expectedState = storeGeneration === null ? historicalState : digest({
             domain: 'action-gateway/reconciliation-state/v2', manifestRevision: 2, storeGeneration, historicalState,
         });
-        return Object.freeze({ status: 'eligible', observedPrefix: attempt.value.phase, subject, subjectDigest, expectedState });
+        const historicalFloor = [decision.decidedAt, attempt.value.createdAt, execution.updatedAt, runObservedAt,
+            ...anchors.map(({ event }) => event.occurredAt)].sort().at(-1);
+        const result = Object.freeze({ status: 'eligible', observedPrefix: attempt.value.phase, subject, subjectDigest, expectedState });
+        return Object.freeze({ status: 'eligible', result, historicalFloor, runRevision });
     }
     catch {
         return refuse('invalid-history');

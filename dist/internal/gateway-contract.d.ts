@@ -1,7 +1,7 @@
 import type { ActionDefinition, ActionProposal, ActionProposalContext } from './action-contract.js';
 import type { RunReference } from './task-run.js';
 import type { PolicyEvaluationInput } from './base-policy.js';
-import type { LocalRecordPort, LocalTransactionalRecordPort } from './local-store.js';
+import type { LocalLockedRecordPort, LocalTransactionalRecordPort } from './local-store.js';
 import type { ExecutionAuditPort } from './execution-audit.js';
 import type { DigestVersion } from './digest.js';
 export type GatewayScope = Readonly<{
@@ -118,7 +118,7 @@ export type ExecutionGatewayOptions = Readonly<{
     approvalLifetimeMs: number;
     adapterTimeoutMs: number;
     /** Trusted admission under the project writer, after policy/approval and before any dispatch reservation. */
-    admit?(port: LocalRecordPort, binding: ExactActionBinding): Promise<boolean>;
+    admit?(port: LocalLockedRecordPort, binding: ExactActionBinding): Promise<boolean>;
 }>;
 export type GatewayErrorCode = 'invalid-record' | 'invalid-proposal' | 'invalid-policy' | 'blocked-policy' | 'approval-required' | 'approval-denied' | 'invalid-approval' | 'expired' | 'stale-context' | 'scope-denied' | 'run-not-ready' | 'replay' | 'reconciliation-required' | 'storage-failure' | 'task-limit';
 export declare class ExecutionGatewayError extends Error {

@@ -30,15 +30,23 @@ export type ReconciliationSubject = Readonly<{
     }>;
 }>;
 type Refusal = 'missing-operation' | 'not-held' | 'missing-attempt' | 'closed-attempt' | 'unsupported-prefix' | 'invalid-history';
-type SubjectResult = Readonly<{
+type IneligibleSubject = Readonly<{
     status: 'ineligible';
     reason: Refusal;
-}> | Readonly<{
+}>;
+type EligibleSubject = Readonly<{
     status: 'eligible';
     observedPrefix: 'reserved' | 'reconciliation-required';
     subject: ReconciliationSubject;
     subjectDigest: string;
     expectedState: string;
+}>;
+type SubjectResult = IneligibleSubject | EligibleSubject;
+type VerifiedSubject = IneligibleSubject | Readonly<{
+    status: 'eligible';
+    result: EligibleSubject;
+    historicalFloor: string;
+    runRevision: number;
 }>;
 export declare const gatewayAgent: {
     id: string;
@@ -52,4 +60,6 @@ export declare const historicalProfile: ActionPolicyProfile;
  * writer by any future decision path.
  */
 export declare function readReconciliationSubject(state: ReadState, audit: Pick<ExecutionAuditPort, 'read'>, projectId: string, operationKey: string): Promise<SubjectResult>;
+/** With a stored witness, verify the original prefix of an intact, replay-validated Run. */
+export declare function reconstructReconciliationSubject(state: ReadState, audit: Pick<ExecutionAuditPort, 'read'>, projectId: string, operationKey: string, runRevisionAtQualification?: number): Promise<VerifiedSubject>;
 export {};

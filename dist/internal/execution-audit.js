@@ -5,7 +5,7 @@ export class ExecutionAuditError extends Error {
 }
 const types = ['action-proposed', 'policy-evaluated', 'approval-requested',
     'approval-recorded', 'execution-authority-granted', 'execution-started', 'execution-result-recorded',
-    'reconciliation-started', 'reconciliation-completed'];
+    'reconciliation-started', 'reconciliation-completed', 'reconciliation-decision-qualified'];
 function object(value, keys) {
     if (!value || typeof value !== 'object' || Array.isArray(value)
         || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
@@ -82,13 +82,14 @@ export function readExecutionAudit(text, projectId) {
 export function createExecutionAuditStore(port, projectId) {
     return Object.freeze({
         async read() { return readExecutionAudit(await port.read(), projectId); },
-        async append(value) {
+        async append(value, verifyHistory) {
             const event = validateExecutionAuditEvent(value);
             if (event.projectId !== projectId)
                 throw new ExecutionAuditError('invalid-event');
             let result;
             await port.appendLine((history) => {
                 const records = readExecutionAudit(history, projectId);
+                verifyHistory?.(records);
                 const previous = records.find((entry) => entry.event.id === event.id);
                 if (previous) {
                     if (JSON.stringify(previous.event) !== JSON.stringify(event))

@@ -17,3 +17,4 @@ export declare function computeRecordEnvelopeChecksum(envelope: {
 }): string;
 /** v0.1.0 used the default Node/ICU localeCompare ordering with stable ties. */
 export declare function createLegacySnapshotChecksum(locale?: string): SnapshotChecksum;
+export declare function validateExplicitLegacyLocale(locale: string): void;

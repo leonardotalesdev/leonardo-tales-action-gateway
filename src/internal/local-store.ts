@@ -4,8 +4,9 @@ import { dirname, isAbsolute, join, parse, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 
 import { computeRecordEnvelopeChecksum, computeSnapshotChecksum, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion,
-  type DigestVersion, type SnapshotChecksum } from './digest.js'
+  validateExplicitLegacyLocale, type DigestVersion, type SnapshotChecksum } from './digest.js'
 import { copyLocalJson, LocalStoreError, maxBytes, rejectLocalProxy, type RecordBody } from './local-record.js'
+import { isReconciliationRecordId, parseReconciliationDecision, sameQualification } from './reconciliation-record.js'
 
 export { copyLocalJson, LocalStoreError, type LocalStoreErrorCode } from './local-record.js'
 export type LocalRecord = RecordBody & Readonly<{ digestVersion: DigestVersion }>
@@ -17,9 +18,14 @@ export type LocalRecordPort = Readonly<{
   create(record: RecordWrite): Promise<void>
   save(record: RecordWrite, expectedRevision: number): Promise<void>
 }>
+type HistoryReadPort = Pick<LocalRecordPort, 'read' | 'list' | 'checksumFor'>
+export type LocalLockedRecordPort = LocalRecordPort & Readonly<{
+  strictHistory: HistoryReadPort
+  syncDecisionDirectory(): Promise<void>
+}>
 /** Trusted host critical section. Its scoped port expires when the callback settles. */
 export type LocalTransactionalRecordPort = LocalRecordPort & Readonly<{
-  exclusive<T>(work: (port: LocalRecordPort) => Promise<T>): Promise<T>
+  exclusive<T>(work: (port: LocalLockedRecordPort) => Promise<T>): Promise<T>
 }>
 export type LocalAuditPort = Readonly<{
   read(): Promise<string>
@@ -29,12 +35,53 @@ export type LocalAuditPort = Readonly<{
 export type LocalStoreOptions = Readonly<{
   checkpoint?: (stage: 'temporary-synced' | 'renamed' | 'directory-synced') => void | Promise<void>
 }>
+type ReconciliationWritePort = HistoryReadPort & Readonly<{
+  createDecision(record: LocalRecord): Promise<void>
+  applyDecision(record: LocalRecord): Promise<void>
+  syncDecisionDirectory(): Promise<void>
+}>
+export type PairedReconciliationStore = Readonly<{
+  projectId: string
+  state: Readonly<{
+    exclusive<T>(work: (port: ReconciliationWritePort) => Promise<T>): Promise<T>
+  }>
+  audit: LocalAuditPort
+}>
+type ReconciliationStoreOptions = Readonly<{
+  legacyDigestLocale?: string
+  stateCheckpoint?: LocalStoreOptions['checkpoint']
+  auditCheckpoint?: LocalStoreOptions['checkpoint']
+}>
+const pairedStores = new WeakSet<PairedReconciliationStore>()
+
+export function isPairedReconciliationStore(value: unknown): value is PairedReconciliationStore {
+  return !!value && typeof value === 'object' && pairedStores.has(value as PairedReconciliationStore)
+}
+
+/** Share the explicit R2 locale policy with private R3 storage composition. */
+export function createExplicitStoreChecksum(locale?: string, deferLocaleValidation = false): LocalRecordPort['checksumFor'] {
+  if (locale !== undefined && !deferLocaleValidation) validateExplicitLegacyLocale(locale)
+  let legacy: SnapshotChecksum | undefined
+  return (version) => {
+    if (version === currentDigestVersion) return computeSnapshotChecksum
+    if (version !== legacyDigestVersion) throw new LocalStoreError('invalid-record')
+    if (locale === undefined) throw new LocalStoreError('legacy-digest-locale-required')
+    if (!legacy) {
+      if (deferLocaleValidation) validateExplicitLegacyLocale(locale)
+      legacy = createLegacySnapshotChecksum(locale)
+    }
+    return legacy
+  }
+}
 
 export const actionAllowanceKind = 'action-allowance'
 export const taskManifestId = 'task-allowance'
 const kinds = ['tasks', 'runs', 'execution', 'proposals', 'approval-requests', 'approval-decisions', 'gateway-attempts', actionAllowanceKind]
 const immutableKinds = ['proposals', 'approval-requests', 'approval-decisions']
 const recordKeys = ['kind', 'id', 'projectId', 'revision', 'payload']
+function decisionRecord(record: RecordBody) {
+  return record.kind === actionAllowanceKind && isReconciliationRecordId(record.id)
+}
 export function localId(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(value)
 }
@@ -198,7 +245,9 @@ export function verifyRecordEnvelope(value: unknown, projectId: string, kind: st
   const checksum = legacy ? checksumFor(legacyDigestVersion)(record) : computeRecordEnvelopeChecksum({ schemaVersion, digestVersion, record })
   if (raw.checksum !== checksum || record.projectId !== projectId || record.kind !== kind
     || (id !== undefined && record.id !== id)) throw new LocalStoreError('corrupt-record')
-  return { envelope: value as RecordEnvelope, record: Object.freeze({ ...record, digestVersion }) }
+  const decoded: LocalRecord = Object.freeze({ ...record, digestVersion })
+  if (decisionRecord(record)) parseReconciliationDecision(decoded)
+  return { envelope: value as RecordEnvelope, record: decoded }
 }
 
 function decodeRecord(text: string, projectId: string, kind: string, checksumFor: LocalRecordPort['checksumFor'], id?: string) {
@@ -218,24 +267,37 @@ export function encodeRecordEnvelope(record: RecordBody, digestVersion: DigestVe
 export async function openLocalRecordStore(directory: string, projectId: string,
   options: LocalStoreOptions & { legacyDigestLocale?: string } = {}): Promise<LocalTransactionalRecordPort> {
   const legacyChecksum = createLegacySnapshotChecksum(options.legacyDigestLocale)
-  function checksumFor(version: DigestVersion) {
+  const checksumFor = (version: DigestVersion) => {
     if (version === legacyDigestVersion) return legacyChecksum
     if (version === currentDigestVersion) return computeSnapshotChecksum
     throw new LocalStoreError('invalid-record')
   }
-  const { base, writer } = await area(directory, projectId, options)
-  for (const kind of kinds) await safeDirectory(join(base, kind), true)
+  const strictChecksumFor = createExplicitStoreChecksum(options.legacyDigestLocale, true)
+  return openRecordStore(directory, projectId, options, checksumFor, strictChecksumFor, true)
+}
+
+async function openRecordStore(directory: string, projectId: string, options: LocalStoreOptions,
+  checksumFor: HistoryReadPort['checksumFor'], strictChecksumFor: HistoryReadPort['checksumFor'],
+  create: boolean): Promise<LocalTransactionalRecordPort> {
+  const { base, writer } = await area(directory, projectId, options, create)
+  if (create) for (const kind of kinds) await safeDirectory(join(base, kind), true)
+
   function pathFor(kind: string, id: string) {
     if (!kinds.includes(kind)) throw new LocalStoreError('invalid-record')
     if (!localId(id)) throw new LocalStoreError('invalid-id')
     return join(base, kind, `${computeSnapshotChecksum(id)}.json`)
   }
-  async function read(kind: string, id: string): Promise<LocalRecord | null> {
+  function readRecord(text: string, kind: string, id: string | undefined, strict: boolean): LocalRecord {
+    const { record } = decodeRecord(text, projectId, kind, strict ? strictChecksumFor : checksumFor, id)
+    if (strict && record.digestVersion === legacyDigestVersion) strictChecksumFor(legacyDigestVersion)
+    return record
+  }
+  async function read(kind: string, id: string, strict = false): Promise<LocalRecord | null> {
     const path = pathFor(kind, id)
     await safeDirectory(dirname(path), false)
     const text = await readText(path)
     if (text === null) return null
-    return decodeRecord(text, projectId, kind, checksumFor, id).record
+    return readRecord(text, kind, id, strict)
   }
   async function write(value: RecordWrite, expected: number | null, replace: (path: string, text: string) => Promise<void>) {
     // Checking for the optional version probes the write envelope before localObject.
@@ -256,9 +318,21 @@ export async function openLocalRecordStore(directory: string, projectId: string,
     const version = digestVersion ?? previous?.digestVersion ?? currentDigestVersion
     if ((version !== legacyDigestVersion && version !== currentDigestVersion)
       || (previous && version !== previous.digestVersion)) throw new LocalStoreError('invalid-record')
+    if (decisionRecord(record)) {
+      const nextDecision = parseReconciliationDecision({ ...record, digestVersion: version })
+      if (previous) {
+        const priorDecision = parseReconciliationDecision(previous)
+        if (previous.revision !== 1 || record.revision !== 2
+          || priorDecision.qualificationDigest !== nextDecision.qualificationDigest
+          || priorDecision.runRevisionAtQualification !== nextDecision.runRevisionAtQualification
+          || !sameQualification(priorDecision.qualification, nextDecision.qualification)) {
+          throw new LocalStoreError('invalid-record')
+        }
+      }
+    }
     await replace(pathFor(record.kind, record.id), `${JSON.stringify(encodeRecordEnvelope(record, version))}\n`)
   }
-  async function list(kind: string) {
+  async function list(kind: string, strict = false) {
     pathFor(kind, 'validate-id')
     await safeDirectory(join(base, kind), false)
     const results: LocalRecord[] = []
@@ -266,23 +340,39 @@ export async function openLocalRecordStore(directory: string, projectId: string,
       if (!/^[a-f0-9]{64}\.json$/.test(name)) continue
       const text = await readText(join(base, kind, name))
       try {
-        const { record } = decodeRecord(text!, projectId, kind, checksumFor)
+        const record = readRecord(text!, kind, undefined, strict)
         if (`${computeSnapshotChecksum(record.id)}.json` !== name) throw new Error()
         results.push(record)
-      } catch { throw new LocalStoreError('corrupt-record') }
+      } catch (error) {
+        if (strict && error instanceof LocalStoreError && error.code === 'legacy-digest-locale-required') throw error
+        throw new LocalStoreError('corrupt-record')
+      }
     }
     return Object.freeze(results)
   }
   return Object.freeze({ checksumFor, read, list,
     create: (record: RecordWrite) => writer((replace) => write(record, null, replace)),
     save: (record: RecordWrite, expectedRevision: number) => writer((replace) => write(record, expectedRevision, replace)),
-    exclusive: <T>(work: (port: LocalRecordPort) => Promise<T>) => writer(async (replace) => {
+    exclusive: <T>(work: (port: LocalLockedRecordPort) => Promise<T>) => writer(async (replace) => {
       let active = true
       function check() { if (!active) throw new LocalStoreError('locked') }
-      const scoped: LocalRecordPort = Object.freeze({
-        checksumFor: (version) => { check(); return checksumFor(version) },
-        read: async (kind: string, id: string) => { check(); const result = await read(kind, id); check(); return result },
-        list: async (kind: string) => { check(); const result = await list(kind); check(); return result },
+      function history(strict: boolean): HistoryReadPort {
+        return Object.freeze({
+          checksumFor: (version) => { check(); return (strict ? strictChecksumFor : checksumFor)(version) },
+          read: async (kind, id) => { check(); const result = await read(kind, id, strict); check(); return result },
+          list: async (kind) => { check(); const result = await list(kind, strict); check(); return result },
+        })
+      }
+      const scoped: LocalLockedRecordPort = Object.freeze({
+        ...history(false),
+        strictHistory: history(true),
+        async syncDecisionDirectory() {
+          check()
+          const directory = join(base, actionAllowanceKind)
+          await safeDirectory(directory, false)
+          await syncDirectory(directory)
+          check()
+        },
         create: async (record: RecordWrite) => { check(); await write(record, null, replace) },
         save: async (record: RecordWrite, expected: number) => { check(); await write(record, expected, replace) },
       })
@@ -293,7 +383,12 @@ export async function openLocalRecordStore(directory: string, projectId: string,
 
 /** Append-only API; full-file atomic replacement keeps partial JSONL tails out of history. */
 export async function openLocalAuditPort(directory: string, projectId: string, options: LocalStoreOptions = {}): Promise<LocalAuditPort> {
-  const { base, writer } = await area(directory, projectId, options)
+  return openAuditPort(directory, projectId, options, true)
+}
+
+async function openAuditPort(directory: string, projectId: string, options: LocalStoreOptions,
+  create: boolean): Promise<LocalAuditPort> {
+  const { base, writer } = await area(directory, projectId, options, create)
   const path = join(base, 'events.jsonl')
   async function read() { await safeDirectory(base, false); return (await readText(path)) ?? '' }
   return Object.freeze({ read, async appendLine(build: (history: string) => string | null) {
@@ -306,6 +401,38 @@ export async function openLocalAuditPort(directory: string, projectId: string, o
       return line
     })
   } })
+}
+
+/** Pair existing state and audit beneath one verified Task directory. */
+export async function openReconciliationStore(
+  directory: string, projectId: string, options: ReconciliationStoreOptions = {},
+): Promise<PairedReconciliationStore> {
+  if (!canonicalGatewayPath(directory)) throw new LocalStoreError('unsafe-path')
+  await verifyGatewayDirectory(directory)
+  const checksumFor = createExplicitStoreChecksum(options.legacyDigestLocale, true)
+  const state = await openRecordStore(join(directory, 'state'), projectId, { checkpoint: options.stateCheckpoint },
+    checksumFor, checksumFor, false)
+  const audit = await openAuditPort(join(directory, 'audit'), projectId, { checkpoint: options.auditCheckpoint }, false)
+  const store: PairedReconciliationStore = Object.freeze({
+    projectId,
+    state: Object.freeze({
+      exclusive: <T>(work: (port: ReconciliationWritePort) => Promise<T>) => state.exclusive((port) => work(Object.freeze({
+        ...port.strictHistory,
+        syncDecisionDirectory: port.syncDecisionDirectory,
+        async createDecision(record: LocalRecord) {
+          if (!decisionRecord(record) || record.revision !== 1) throw new LocalStoreError('invalid-record')
+          await port.create(record)
+        },
+        async applyDecision(record: LocalRecord) {
+          if (!decisionRecord(record) || record.revision !== 2) throw new LocalStoreError('invalid-record')
+          await port.save(record, 1)
+        },
+      }))),
+    }),
+    audit,
+  })
+  pairedStores.add(store)
+  return store
 }
 
 /** Existing Task paths only. The writer can replace just the canonical manifest. */

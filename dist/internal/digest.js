@@ -56,3 +56,28 @@ export function createLegacySnapshotChecksum(locale) {
     const { compare } = new Intl.Collator(locale);
     return (payload) => legacyChecksum(payload, compare);
 }
+export function validateExplicitLegacyLocale(locale) {
+    const [canonical] = Intl.Collator.supportedLocalesOf(locale, { localeMatcher: 'lookup' });
+    const unicodeExtension = /-u((?:-[a-z0-9]{2,8})+)/.exec(locale.toLowerCase());
+    // Canonicalization can silently keep just the first value for a repeated key.
+    const unicodeKeys = unicodeExtension?.[1].split('-').filter((part) => part.length === 2) ?? [];
+    const unsupported = 'unsupported-legacy-digest-locale';
+    if (!canonical || new Set(unicodeKeys).size !== unicodeKeys.length)
+        throw new Error(unsupported);
+    const requested = new Intl.Locale(canonical);
+    const [regionalLocale] = Intl.DateTimeFormat.supportedLocalesOf(requested.baseName, { localeMatcher: 'lookup' });
+    if (!regionalLocale)
+        throw new Error(unsupported);
+    // Date formatting carries regional data even when collation is shared with the parent language.
+    const regional = new Intl.Locale(new Intl.DateTimeFormat(regionalLocale).resolvedOptions().locale).maximize();
+    if (requested.maximize().baseName !== regional.baseName
+        || (requested.script && requested.script !== regional.script)
+        || (requested.region && requested.region !== regional.region))
+        throw new Error(unsupported);
+    // Match the legacy digest collator's resolution and require every requested extension to survive.
+    const resolved = new Intl.Locale(new Intl.Collator(canonical, { localeMatcher: 'best fit' }).resolvedOptions().locale);
+    if (resolved.language !== requested.language
+        || canonical.slice(requested.baseName.length) !== resolved.toString().slice(resolved.baseName.length)) {
+        throw new Error(unsupported);
+    }
+}

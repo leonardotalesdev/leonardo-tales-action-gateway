@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 export type ExecutionAuditEventType = 'action-proposed' | 'policy-evaluated' | 'approval-requested'
   | 'approval-recorded' | 'execution-authority-granted' | 'execution-started'
   | 'execution-result-recorded' | 'reconciliation-started' | 'reconciliation-completed'
+  | 'reconciliation-decision-qualified'
 export type ExecutionAuditEvent = Readonly<{
   schemaVersion: 'execution-audit-event/v0.1'
   id: string; projectId: string; taskId: string; runId: string; occurredAt: string
@@ -24,7 +25,7 @@ export class ExecutionAuditError extends Error {
 }
 const types: readonly ExecutionAuditEventType[] = ['action-proposed', 'policy-evaluated', 'approval-requested',
   'approval-recorded', 'execution-authority-granted', 'execution-started', 'execution-result-recorded',
-  'reconciliation-started', 'reconciliation-completed']
+  'reconciliation-started', 'reconciliation-completed', 'reconciliation-decision-qualified']
 function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
@@ -91,12 +92,14 @@ export function readExecutionAudit(text: string, projectId: string): readonly Ex
 export function createExecutionAuditStore(port: ExecutionAuditPort, projectId: string) {
   return Object.freeze({
     async read() { return readExecutionAudit(await port.read(), projectId) },
-    async append(value: ExecutionAuditEvent): Promise<ExecutionAuditEnvelope> {
+    async append(value: ExecutionAuditEvent,
+      verifyHistory?: (records: readonly ExecutionAuditEnvelope[]) => void): Promise<ExecutionAuditEnvelope> {
       const event = validateExecutionAuditEvent(value)
       if (event.projectId !== projectId) throw new ExecutionAuditError('invalid-event')
       let result: ExecutionAuditEnvelope | undefined
       await port.appendLine((history) => {
         const records = readExecutionAudit(history, projectId)
+        verifyHistory?.(records)
         const previous = records.find((entry) => entry.event.id === event.id)
         if (previous) {
           if (JSON.stringify(previous.event) !== JSON.stringify(event)) throw new ExecutionAuditError('event-conflict')

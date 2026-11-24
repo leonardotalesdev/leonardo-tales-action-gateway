@@ -1,17 +1,18 @@
 import { randomBytes } from 'node:crypto'
 import { createTaskAllowance, nativeRunId } from './action-allowance.js'
-import { computeSnapshotChecksum as digest, createLegacySnapshotChecksum, currentDigestVersion, legacyDigestVersion,
-  type SnapshotChecksum } from './digest.js'
+import { computeSnapshotChecksum as digest, currentDigestVersion, legacyDigestVersion } from './digest.js'
 import { readExecutionAudit } from './execution-audit.js'
 import { loadAttempt, parseStoredProposal } from './execution-gateway.js'
 import { executionStateIdentity, validateExecutionState } from './execution-state.js'
 import { approvalDecisionId, parseApprovalDecision, parseApprovalRequest } from './gateway-approval.js'
 import { policyInput } from './gateway-policy.js'
 import {
-  actionAllowanceKind, copyLocalJson, encodeRecordEnvelope, localId, localObject, LocalStoreError, openExistingPromotionStore,
+  actionAllowanceKind, copyLocalJson, createExplicitStoreChecksum, encodeRecordEnvelope, localId, localObject, LocalStoreError, openExistingPromotionStore,
   taskManifestId, verifyRecordEnvelope, type LocalRecord, type LocalRecordPort, type LocalStoreOptions,
 } from './local-store.js'
 import { gatewayAgent, historicalDefinition, historicalProfile } from './reconciliation.js'
+import { readReconciliationDecisions } from './reconciliation-decision.js'
+import { isReconciliationRecordId } from './reconciliation-record.js'
 import { projectManifest, taskStoreIdentity } from './store-manifest.js'
 import { restoreRun, restoreTask } from './task-run-store.js'
 
@@ -57,7 +58,7 @@ async function verifyHistory(snapshot: Snapshot, taskId: string, projectId: stri
   const definition = historicalDefinition(actionRef)
   const profile = historicalProfile
   for (const row of collections.get(actionAllowanceKind)!.values()) {
-    if (row.id === taskManifestId) continue
+    if (row.id === taskManifestId || isReconciliationRecordId(row.id)) continue
     const operation = allowance.parseOperation(row)
     const run = runs.get(nativeRunId(operation.runId))
     requireHistory(run && run.revision >= operation.runRevision && operation.createdAt >= run.createdAt)
@@ -130,49 +131,18 @@ async function verifyHistory(snapshot: Snapshot, taskId: string, projectId: stri
   for (const kind of ['proposals', 'approval-requests', 'approval-decisions', 'execution', 'gateway-attempts']) {
     for (const row of collections.get(kind)!.values()) requireHistory(accounted.has(row))
   }
-  await allowance.snapshot(snapshotPort)
+  const decisions = await readReconciliationDecisions(snapshotPort, { read: async () => snapshot.audit }, projectId)
+  await allowance.snapshot(snapshotPort, undefined, decisions)
   for (const { event } of readExecutionAudit(snapshot.audit, projectId)) {
     requireHistory(event.taskId === taskId)
   }
   return { source, storeGeneration }
 }
 
-function validateExplicitLegacyLocale(locale: string): void {
-  const [canonical] = Intl.Collator.supportedLocalesOf(locale, { localeMatcher: 'lookup' })
-  const unicodeExtension = /-u((?:-[a-z0-9]{2,8})+)/.exec(locale.toLowerCase())
-  // Canonicalization can silently keep just the first value for a repeated key.
-  const unicodeKeys = unicodeExtension?.[1].split('-').filter((part) => part.length === 2) ?? []
-  const unsupported = 'unsupported-legacy-digest-locale'
-  if (!canonical || new Set(unicodeKeys).size !== unicodeKeys.length) throw new Error(unsupported)
-
-  const requested = new Intl.Locale(canonical)
-  const [regionalLocale] = Intl.DateTimeFormat.supportedLocalesOf(requested.baseName, { localeMatcher: 'lookup' })
-  if (!regionalLocale) throw new Error(unsupported)
-
-  // Date formatting carries regional data even when collation is shared with the parent language.
-  const regional = new Intl.Locale(new Intl.DateTimeFormat(regionalLocale).resolvedOptions().locale).maximize()
-  if (requested.maximize().baseName !== regional.baseName
-    || (requested.script && requested.script !== regional.script)
-    || (requested.region && requested.region !== regional.region)) throw new Error(unsupported)
-
-  // Match the legacy digest collator's resolution and require every requested extension to survive.
-  const resolved = new Intl.Locale(new Intl.Collator(canonical, { localeMatcher: 'best fit' }).resolvedOptions().locale)
-  if (resolved.language !== requested.language
-    || canonical.slice(requested.baseName.length) !== resolved.toString().slice(resolved.baseName.length)) {
-    throw new Error(unsupported)
-  }
-}
-
 /** Offline and format-only. Checkpoints are private fault-injection hooks. */
 export async function promoteTaskStore(directory: string, originalTaskId: string, locale?: string, options: LocalStoreOptions = {}) {
   if (!localId(originalTaskId)) throw new LocalStoreError('invalid-id')
-  if (locale !== undefined) validateExplicitLegacyLocale(locale)
-  let legacy: SnapshotChecksum | undefined
-  const checksumFor: LocalRecordPort['checksumFor'] = (version) => {
-    if (version === currentDigestVersion) return digest
-    if (locale === undefined) throw new LocalStoreError('legacy-digest-locale-required')
-    return legacy ??= createLegacySnapshotChecksum(locale)
-  }
+  const checksumFor = createExplicitStoreChecksum(locale)
   const { projectId, taskId } = taskStoreIdentity(originalTaskId)
   const store = await openExistingPromotionStore(directory, projectId, checksumFor, options)
   await store.requireStateUnlocked()

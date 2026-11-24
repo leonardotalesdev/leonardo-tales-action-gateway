@@ -67,7 +67,8 @@ try {
     "import * as api from '@leonardo-tales/action-gateway'",
     "import { verify } from './out/consumer.js'",
     "assert.deepEqual(Object.keys(api), ['createActionGateway'])",
-    ...['internal/execution-gateway', 'internal/store-promotion', 'internal/reconciliation', 'cli/promote-r2'].map((path) =>
+    ...['internal/execution-gateway', 'internal/store-promotion', 'internal/reconciliation',
+      'internal/reconciliation-decision', 'cli/promote-r2'].map((path) =>
       `await assert.rejects(import('${name}/dist/${path}.js'), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })`),
     "const gateway = await api.createActionGateway({ directory: process.cwd() + '/data', task: { id: 'consumer-task', cap: 1, unit: 'rows', expiresAt: '2030-01-02T00:00:00.000Z' }, approverId: 'test-operator', review: async () => 'PENDING', tool: { id: 'customer.export', revision: 1, amount: () => 1, execute: async () => ({ outcome: 'unknown' }) } })",
     "assert.deepEqual(Object.keys(gateway).sort(), ['execute', 'inspect'])",

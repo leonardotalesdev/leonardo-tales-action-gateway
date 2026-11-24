@@ -3,9 +3,10 @@ import { createRun, transitionRun, getRunNextAction, type Run, type RunEvent, ty
 import { validateActionProposal, type ActionProposal, type ActionProposalInput } from './action-contract.js'
 import { createExecutionAuditStore, validateExecutionAuditEvent, type ExecutionAuditEvent } from './execution-audit.js'
 import { computeSnapshotChecksum as digest, legacyDigestVersion, type DigestVersion, type SnapshotChecksum } from './digest.js'
-import { copyLocalJson, localId, localObject, localRevision, localTimestamp, type LocalRecord, type LocalRecordPort } from './local-store.js'
+import { actionAllowanceKind, copyLocalJson, localId, localObject, localRevision, localTimestamp, type LocalRecord, type LocalRecordPort } from './local-store.js'
 import { createExecutionStateStore, executionStateIdentity, validateExecutionState, type ExecutionBinding } from './execution-state.js'
 import { assessPolicy, policyInput } from './gateway-policy.js'
+import { reconciliationDecisionId } from './reconciliation-record.js'
 import { approvalDecisionId, approvalRequestId, makeApprovalRequest, parseApprovalDecision, parseApprovalRequest } from './gateway-approval.js'
 import {
   ExecutionGatewayError, type ExecutionGatewayOptions, type ExactActionBinding, type ExactApprovalDecision,
@@ -270,7 +271,15 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
     if (prior) fail(prior.value.phase === 'closed' ? 'replay' : 'reconciliation-required')
     await otherPending(port, exact)
   }
+  async function requireUnadjudicated(port: LocalRecordPort, stored: ProposalRecord) {
+    const operationKey = stored.proposal.input.operationKey
+    if (!localId(operationKey)) return
+    const { projectId, taskId, executionId: attemptId, executionIdentity } = stored.binding
+    const id = reconciliationDecisionId({ projectId, taskId, operationKey, attemptId, executionIdentity })
+    if (await port.read(actionAllowanceKind, id)) fail('reconciliation-required')
+  }
   async function markUnknown(port: LocalRecordPort, stored: ProposalRecord) {
+    await requireUnadjudicated(port, stored)
     const executions = createExecutionStateStore(port, scope.projectId, digestVersion)
     let execution = await executions.load(stored.binding.executionId)
     if (execution?.status === 'proposed') execution = await executions.recordObservation(execution.id, execution.revision, 'execution_started', now())
@@ -442,6 +451,7 @@ export function createTrustedExecutionGateway(options: ExecutionGatewayOptions) 
           return { status: 'execution_unknown', code: 'adapter-ambiguous', executionId: stored!.binding.executionId }
         }
         await state.exclusive(async (port) => {
+          await requireUnadjudicated(port, stored!)
           await saveAttempt(port, stored!.binding, { result: observed })
           const executions = createExecutionStateStore(port, scope.projectId, digestVersion)
           await executions.recordObservation(stored!.binding.executionId, 2, observed.status === 'confirmed-success' ? 'executed' : 'failed', now())
